@@ -297,7 +297,10 @@ mod tests {
         fs,
         io::{Read as _, Write as _},
         net::{TcpListener, TcpStream},
-        os::unix::{fs::PermissionsExt as _, net::UnixListener},
+        os::unix::{
+            fs::PermissionsExt as _,
+            net::{UnixListener, UnixStream as StdUnixStream},
+        },
         path::{Path, PathBuf},
         thread,
         time::Duration,
