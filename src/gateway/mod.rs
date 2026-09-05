@@ -25,6 +25,7 @@ pub use authorization::{AuthorizationTrust, ExactAuthorization};
 use journal::Journal;
 #[cfg(test)]
 pub(crate) use kubernetes::{
+    deployment_patch_document_for_test as test_deployment_patch_document,
     ApplyOutcome as TestApplyOutcome,
     KubernetesDeploymentImageAdapter as TestKubernetesDeploymentImageAdapter,
     ReceiverObservation as TestReceiverObservation, TargetIdentity as TestTargetIdentity,

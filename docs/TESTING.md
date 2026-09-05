@@ -99,7 +99,9 @@ only how many cases run, not their semantics.
 
 The live-kind gate owns real Kubernetes success, defined failed rollout, bounded `UNKNOWN`, and
 process loss against a uniquely owned disposable cluster. It must show no blind second patch and
-must clean up or export bounded failure evidence.
+must clean up or export bounded failure evidence. Its recovery-policy case uses an instrumented
+mutating webhook to separate PATCH requests and admission effects from persisted Deployment and
+controller effects when an identical stale patch is replayed.
 
 The public demonstration adds an observable evaluator path through healthy,
 `ProgressDeadlineExceeded`, mutation-loss, and receipt-publication-loss cases. Compile-time harness

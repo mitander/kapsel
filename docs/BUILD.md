@@ -8,7 +8,7 @@ strategy; direct contracts own behavior and evidence limits.
 The deterministic gate uses Rust 1.98, rustfmt from nightly-2026-07-03, Python 3.11+, Node.js 24,
 and Prettier 3.6.2 as pinned by the repository. Additional lanes require:
 
-- Docker and kind 0.32+ for live Kubernetes;
+- Docker, kind 0.32+, kubectl 1.30+, and OpenSSL for live Kubernetes;
 - kubectl 1.30+ for the public demonstration;
 - cargo-fuzz 0.13+ and the pinned Rust nightly for fuzzing;
 - Linux and `sg` for the ignored distinct-effective-group service test;
@@ -220,14 +220,16 @@ Qualification is finite candidate evidence, not a production or support claim.
 
 ## Live Kubernetes gate
 
-With Docker and kind 0.32+:
+With Docker, kind 0.32+, kubectl 1.30+, and OpenSSL:
 
 ```sh
 ./scripts/test-kind-effect-gateway.sh
 ```
 
-The script owns creation, failure-log export, and cleanup of its uniquely named cluster. This lane
-is separate from deterministic CI.
+The script owns creation, failure-log export, and cleanup of its uniquely named cluster. It also
+installs an instrumented mutating webhook and proves on the pinned Kubernetes v1.33.12 receiver that
+an identical stale patch reaches admission again without a second Deployment or controller effect.
+This lane is separate from deterministic CI.
 
 ## Public crash-recovery demonstration
 

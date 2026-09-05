@@ -242,6 +242,14 @@ fn deployment_patch_document(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn deployment_patch_document_for_test(
+    request: &SetDeploymentImageRequest,
+    target: &TargetIdentity,
+) -> Value {
+    deployment_patch_document(request, target)
+}
+
 fn receiver_observation(
     request: &SetDeploymentImageRequest,
     deployment: &Deployment,

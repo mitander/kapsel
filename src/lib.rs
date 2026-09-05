@@ -14,6 +14,8 @@ mod gateway;
 #[cfg(test)]
 mod kind_tests;
 #[cfg(test)]
+mod recovery_policy_tests;
+#[cfg(test)]
 mod simulation_tests;
 
 pub use application::{
@@ -28,12 +30,12 @@ pub use gateway::{
     ReceiptStatement, ReceiptTrust, SetDeploymentImageRequest, TargetRejection,
 };
 #[cfg(test)]
-use gateway::{DeploymentImageAdapter, Gateway, ReceiptSettings, TargetReadError};
-#[cfg(test)]
-use gateway::{FaultPoint, GatewayError};
-#[cfg(test)]
 use gateway::{
-    TestApplyOutcome as ApplyOutcome,
+    test_deployment_patch_document, TestApplyOutcome as ApplyOutcome,
     TestKubernetesDeploymentImageAdapter as KubernetesDeploymentImageAdapter,
     TestReceiverObservation as ReceiverObservation, TestTargetIdentity as TargetIdentity,
 };
+#[cfg(test)]
+use gateway::{DeploymentImageAdapter, Gateway, ReceiptSettings, TargetReadError};
+#[cfg(test)]
+use gateway::{FaultPoint, GatewayError};

@@ -108,11 +108,17 @@ requested
 - `finalized` is terminal and read-only.
 
 After `apply_started`, recovery uses the stored Deployment UID, operation annotation, and requested
-image digest to observe and classify the operation. When the patch response was lost, an exact
-matching UID, operation annotation, and image binds the observed current generation to the request;
-without all three facts the requested generation remains unknown. If the available receiver facts
-cannot establish the result, the result is `UNKNOWN`; it is never guessed from request success or a
-timeout.
+image digest to observe and classify the operation. It does not replay even the frozen conditional
+patch: Kubernetes UID and resource-version preconditions bound persisted updates, but do not prevent
+a stale replay from invoking mutating admission and its allowed out-of-band effects again. Decision
+[0011](decisions/0011-retain-observation-only-recovery.md) owns the comparison and evidence.
+
+When the patch response was lost, an exact matching UID, operation annotation, and image binds the
+observed current generation to the request; without all three facts the requested generation remains
+unknown. If a later template writer retains those three facts, that generation may satisfy the
+classifier, but the result does not attribute that later rollout to the original patch. If the
+available receiver facts cannot establish the result, the result is `UNKNOWN`; it is never guessed
+from request success or a timeout.
 
 ## Durable facts and recovery
 

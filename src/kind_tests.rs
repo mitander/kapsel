@@ -5,28 +5,31 @@ use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf
 use ed25519_dalek::SigningKey;
 use k8s_openapi::{
     api::{
-        apps::v1::{Deployment, DeploymentSpec},
-        core::v1::{Container, Namespace, PodSpec, PodTemplateSpec},
+        apps::v1::{Deployment, DeploymentSpec, ReplicaSet},
+        core::v1::{Container, Namespace, Pod, PodSpec, PodTemplateSpec},
     },
     apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta},
 };
 use kube::{
-    api::{Api, DeleteParams, PostParams},
+    api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams},
     Client,
 };
 
 use crate::{
-    inspect_receipt, DeploymentImageAdapter, ExactAuthorization, FaultPoint, Gateway, GatewayError,
-    InspectionLimits, InspectionStatus, KubernetesDeploymentImageAdapter, OperationResult,
-    OperationState, ReceiptSettings, ReceiptTrust, SetDeploymentImageRequest,
+    inspect_receipt, test_deployment_patch_document, DeploymentImageAdapter, ExactAuthorization,
+    FaultPoint, Gateway, GatewayError, InspectionLimits, InspectionStatus,
+    KubernetesDeploymentImageAdapter, OperationResult, OperationState, ReceiptSettings,
+    ReceiptTrust, SetDeploymentImageRequest, TargetIdentity,
 };
 
 const NAMESPACE: &str = "kapsel-effect-gateway";
 const FAILED_NAMESPACE: &str = "kapsel-effect-gateway-failed";
 const UNKNOWN_NAMESPACE: &str = "kapsel-effect-gateway-unknown";
+const POLICY_NAMESPACE: &str = "kapsel-recovery-policy";
 const DEPLOYMENT: &str = "image-demo";
 const FAILED_DEPLOYMENT: &str = "image-demo-failed";
 const UNKNOWN_DEPLOYMENT: &str = "image-demo-unknown";
+const POLICY_DEPLOYMENT: &str = "image-demo-policy";
 const TARGET_IMAGE: &str = concat!(
     "registry.k8s.io/pause@sha256:",
     "278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c"
@@ -210,6 +213,253 @@ async fn kind_deleted_after_patch_recovers_to_classifier_complete_unknown_receip
     );
     assert!(cleanup.is_ok(), "kind unknown fixture cleanup failed");
     proof.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-kind-effect-gateway.sh"]
+async fn kind_stale_exact_replay_reaches_admission_without_a_second_persisted_change() {
+    assert_eq!(std::env::var("KAPSEL_KIND_TEST").as_deref(), Ok("1"));
+    let client = Client::try_default().await.unwrap();
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        namespaces.create(
+            &PostParams::default(),
+            &Namespace {
+                metadata: ObjectMeta {
+                    name: Some(POLICY_NAMESPACE.into()),
+                    labels: Some(BTreeMap::from([(
+                        "kapsel.dev/recovery-policy".into(),
+                        "true".into(),
+                    )])),
+                    ..ObjectMeta::default()
+                },
+                ..Namespace::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let proof = tokio::time::timeout(
+        std::time::Duration::from_mins(1),
+        run_recovery_policy_proof(client.clone()),
+    )
+    .await
+    .map_or_else(
+        |_| Err("kind recovery-policy proof exceeded 60 seconds".into()),
+        |result| result.map_err(|error| error.to_string()),
+    );
+    let cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        namespaces.delete(POLICY_NAMESPACE, &DeleteParams::default()),
+    )
+    .await
+    .map_or_else(
+        |_| Err("kind recovery-policy cleanup exceeded 15 seconds".into()),
+        |result| result.map(|_| ()).map_err(|error| error.to_string()),
+    );
+    assert!(cleanup.is_ok(), "kind recovery-policy cleanup failed");
+    proof.unwrap();
+}
+
+async fn run_recovery_policy_proof(client: Client) -> Result<(), Box<dyn std::error::Error>> {
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), POLICY_NAMESPACE);
+    let replica_sets: Api<ReplicaSet> = Api::namespaced(client.clone(), POLICY_NAMESPACE);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        deployments.create(
+            &PostParams::default(),
+            &fixture_deployment_for(POLICY_NAMESPACE, POLICY_DEPLOYMENT),
+        ),
+    )
+    .await??;
+    wait_for_deployment_rollout(&deployments, POLICY_DEPLOYMENT).await?;
+
+    let request = policy_request();
+    let mut adapter = KubernetesDeploymentImageAdapter::new(client.clone());
+    let frozen_target = adapter.identify(&request).await.map_err(|error| {
+        format!("could not freeze policy target before the first patch: {error:?}")
+    })?;
+    let before = deployments.get(POLICY_DEPLOYMENT).await?;
+    let before_generation = before
+        .metadata
+        .generation
+        .ok_or("missing initial generation")?;
+    let selector = ListParams::default().labels("app=image-demo-policy");
+    let replica_sets_before = replica_sets.list(&selector).await?.items.len();
+
+    let first = adapter
+        .apply(&request, &frozen_target)
+        .await
+        .map_err(|()| "first frozen patch was rejected")?;
+    assert_eq!(
+        first.deployment_uid.as_deref(),
+        Some(frozen_target.deployment_uid.as_str())
+    );
+    wait_for_deployment_rollout(&deployments, POLICY_DEPLOYMENT).await?;
+    let after_first = deployments.get(POLICY_DEPLOYMENT).await?;
+    let first_generation = after_first
+        .metadata
+        .generation
+        .ok_or("missing generation after first patch")?;
+    assert_eq!(first_generation, before_generation + 1);
+    let replica_sets_after_first = replica_sets.list(&selector).await?.items.len();
+    assert_eq!(replica_sets_after_first, replica_sets_before + 1);
+    let admission_after_first = admission_effects(&client, "kind-policy-op-001").await?;
+    assert_eq!(admission_after_first.len(), 1);
+
+    assert_stale_replay_conflicts(&deployments, &request, &frozen_target).await?;
+    let after_replay = deployments.get(POLICY_DEPLOYMENT).await?;
+    assert_eq!(after_replay.metadata.uid, after_first.metadata.uid);
+    assert_eq!(
+        after_replay.metadata.resource_version,
+        after_first.metadata.resource_version
+    );
+    assert_eq!(after_replay.metadata.generation, Some(first_generation));
+    assert_eq!(after_replay.spec, after_first.spec);
+    assert_eq!(
+        deployment_container_image(&after_replay, "target"),
+        Some(TARGET_IMAGE)
+    );
+    assert_eq!(
+        deployment_container_image(&after_replay, "untouched"),
+        Some(FIXTURE_IMAGE)
+    );
+    assert_eq!(
+        after_replay
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("kapsel.dev/kap0038-operation-id"))
+            .map(String::as_str),
+        Some("kind-policy-op-001")
+    );
+    assert_eq!(
+        replica_sets.list(&selector).await?.items.len(),
+        replica_sets_after_first
+    );
+    let admission_after_replay =
+        wait_for_admission_effects(&client, "kind-policy-op-001", 2).await?;
+    assert_eq!(admission_after_replay.len(), 2);
+    let admission_uids = admission_after_replay
+        .iter()
+        .filter_map(|line| line.split_once("uid=").map(|(_, value)| value))
+        .filter_map(|value| value.split_once(' ').map(|(uid, _)| uid))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(admission_uids.len(), 2);
+    report_recovery_policy_evidence(
+        before_generation,
+        first_generation,
+        replica_sets_before,
+        replica_sets_after_first,
+        &admission_after_replay,
+    );
+    Ok(())
+}
+
+async fn assert_stale_replay_conflicts(
+    deployments: &Api<Deployment>,
+    request: &SetDeploymentImageRequest,
+    target: &TargetIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let replay = deployments
+        .patch(
+            POLICY_DEPLOYMENT,
+            &PatchParams::default(),
+            &Patch::Strategic(test_deployment_patch_document(request, target)),
+        )
+        .await;
+    match replay {
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(()),
+        Err(kube::Error::Api(response)) => Err(format!(
+            "stale replay returned Kubernetes API status {}",
+            response.code
+        )
+        .into()),
+        Err(error) => Err(format!("stale replay returned a non-API error: {error}").into()),
+        Ok(_) => Err("stale replay unexpectedly persisted".into()),
+    }
+}
+
+async fn admission_effects(
+    client: &Client,
+    operation_id: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "kapsel-recovery-policy-webhook");
+    let webhook_pods = pods
+        .list(&ListParams::default().labels("app=recovery-policy-webhook"))
+        .await?;
+    let pod = webhook_pods.items.first().ok_or("missing webhook pod")?;
+    let pod_name = pod
+        .metadata
+        .name
+        .as_deref()
+        .ok_or("webhook pod missing name")?;
+    let logs = pods.logs(pod_name, &LogParams::default()).await?;
+    Ok(logs
+        .lines()
+        .filter(|line| {
+            line.contains("KAPSEL_ADMISSION_EFFECT")
+                && line.contains(&format!("operation_id={operation_id}"))
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+async fn wait_for_admission_effects(
+    client: &Client,
+    operation_id: &str,
+    expected: usize,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let effects = admission_effects(client, operation_id).await?;
+            if effects.len() >= expected {
+                return Ok::<Vec<String>, Box<dyn std::error::Error>>(effects);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| "admission effect did not become observable within 10 seconds")?
+}
+
+fn deployment_container_image<'a>(
+    deployment: &'a Deployment,
+    container_name: &str,
+) -> Option<&'a str> {
+    deployment
+        .spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|container| container.name == container_name)?
+        .image
+        .as_deref()
+}
+
+#[allow(clippy::print_stdout)]
+fn report_recovery_policy_evidence(
+    before_generation: i64,
+    after_generation: i64,
+    replica_sets_before: usize,
+    replica_sets_after: usize,
+    admission_effects: &[String],
+) {
+    println!(
+        "[kind recovery-policy] patch_requests=2 replay_status=409 admission_effects={} \
+         persisted_deployment_changes=1 controller_effects=1 \
+         generation={before_generation}->{after_generation} \
+         replica_sets={replica_sets_before}->{replica_sets_after}",
+        admission_effects.len()
+    );
+    for effect in admission_effects {
+        println!("[kind recovery-policy] {effect}");
+    }
 }
 
 async fn run_gateway_proof(client: Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -528,6 +778,16 @@ fn unknown_request() -> SetDeploymentImageRequest {
         operation_id: "kind-unknown-op-001".into(),
         namespace: UNKNOWN_NAMESPACE.into(),
         deployment: UNKNOWN_DEPLOYMENT.into(),
+        container: "target".into(),
+        immutable_image_digest: TARGET_IMAGE.into(),
+    }
+}
+
+fn policy_request() -> SetDeploymentImageRequest {
+    SetDeploymentImageRequest {
+        operation_id: "kind-policy-op-001".into(),
+        namespace: POLICY_NAMESPACE.into(),
+        deployment: POLICY_DEPLOYMENT.into(),
         container: "target".into(),
         immutable_image_digest: TARGET_IMAGE.into(),
     }
