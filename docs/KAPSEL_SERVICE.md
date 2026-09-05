@@ -27,8 +27,11 @@ bounded local caller
 ```
 
 The Kapsel service retains the sole `kubernetes.set_deployment_image` capability. The exact grant
-binds one operation identity, namespace, Deployment, container, and immutable image digest.
-`kapseld` composes `Application`; it does not sequence gateway internals.
+binds one operation identity, namespace, Deployment, container, and immutable image digest. It does
+not bind a Deployment UID or resource version; the gateway reads and freezes those facts after
+submission. The [reconnectable agent action experiment](RECONNECTABLE_AGENT_ACTION.md) records why
+that late binding cannot satisfy a workflow whose operator approval must preserve exact receiver
+preconditions. `kapseld` composes `Application`; it does not sequence gateway internals.
 
 The service process exists because the synchronous CLI and stdio MCP adapter do not provide
 caller-independent lifetime, startup reconciliation, read-only reconnect/status, exact receipt

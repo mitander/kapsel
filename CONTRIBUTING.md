@@ -35,6 +35,8 @@ for hostile lengths. Bound individual items, cumulative work, and diagnostics.
 Use always-on assertions only for invariants controlled by valid internal code. Return typed errors
 for caller input, signatures, trust, provider responses, time, configuration, filesystem, SQLite,
 and other operating failures. Never assert a fact controlled by a caller, receiver, or provider.
+Production `expect()` calls must state the invariant that makes the panic unreachable; do not use an
+unexplained `unwrap()` where an operating or adversarial failure is possible.
 
 ### Types, interfaces, and modules
 
@@ -55,11 +57,17 @@ bounded request
 Pass authority, time, trust, paths, and limits explicitly. A helper must not discover them through
 the environment, filesystem, network, or ambient configuration.
 
+A function should perform one coherent phase at one level of abstraction. Treat length as a review
+prompt, not a metric: split validation, mutation, I/O, and presentation when they represent distinct
+responsibilities, not merely to satisfy a line count. Use identity and unit newtypes when accidental
+interchange would compile and could change meaning.
+
 Add an interface only when it contains policy, preserves a durable state or format owner, keeps I/O
-from pure logic, maintains dependency direction, or provides a useful deterministic seam. Prefer
-`pub(crate)` or narrower visibility. Avoid generic `util`, `common`, provider, or package seams
-without multiple real consumers or a measured dependency boundary. Name functions for the fact they
-establish.
+from pure logic, maintains dependency direction, or provides a useful deterministic seam. Prefer a
+concrete type or exhaustive enum until multiple real consumers establish the need for a trait or
+generic framework. Prefer `pub(crate)` or narrower visibility. Avoid generic `util`, `common`,
+provider, or package seams without multiple real consumers or a measured dependency boundary. Name
+functions for the fact they establish.
 
 ### Documentation and dependencies
 
@@ -84,8 +92,11 @@ authority separation, durable outcomes, observable output, and non-disclosure in
 the same parser or classifier matrix. The [testing strategy](docs/TESTING.md) owns proof placement
 and evidence classes; [Build and test](docs/BUILD.md) owns commands and prerequisites.
 
-Authored Rust has a 100-byte physical-line limit. Markdown prose wraps at 100 columns; tables, URLs,
-and code blocks are exempt where wrapping harms clarity. Before review, run:
+Authored Rust has a 100-byte physical-line limit. Reshape expressions rather than shortening precise
+names or adding an abstraction solely to satisfy the limit. Keep embedded SQL readable and
+multiline. Markdown prose wraps at 100 columns; tables, URLs, and code blocks are exempt where
+wrapping harms clarity. Automate only objective, stable rules; naming, module ownership, comments,
+and abstraction quality remain review judgments. Before review, run:
 
 ```sh
 ./scripts/format.sh
