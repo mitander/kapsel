@@ -12,6 +12,9 @@ released or supported.
 
 ## Engineering rules
 
+[ADR 0001](docs/decisions/0001-kapsel-style.md) owns the engineering philosophy and design
+criterion. Use the [complexity review](#complexity-review) when changing architecture or contracts.
+
 Prioritize the boundaries that make Kapsel useful:
 
 1. Preserve authority and effect boundaries.
@@ -133,4 +136,33 @@ Before handing off a change, check:
 - documentation links resolve, status is current, and the diff contains no stale or duplicated
   truth.
 
-State what changed, what ran, and what remains unproved. No mandatory report template is required.
+### Complexity review
+
+For nontrivial architectural or contract changes, read
+[ADR 0001](docs/decisions/0001-kapsel-style.md#simplicity-is-the-design-criterion) before settling
+the design. Compare the candidates required there before freezing the boundary. Record the chosen
+design and why the alternative loses in the existing review discussion or owning decision, not a
+separate philosophy document.
+
+Use this compact block in that review. Fill each field with concrete facts or `None`, and link to
+existing owners and evidence instead of copying them:
+
+```text
+Complexity delta
+
+Contract owner:
+Knowledge hidden:
+New interfaces, dependencies, configuration, or special cases:
+Existing rule duplicated:
+Alternative design considered:
+Obsolete code or documentation removed:
+Proof at the owning boundary:
+```
+
+Before handoff, compare the block with the actual diff. Check that the named owner hides the claimed
+knowledge, resolve duplicated rules or unexplained new surface, and run the proof at that boundary.
+Record any unresolved concern and missing gate in the same discussion. Mechanical edits, formatting,
+and wording corrections do not need this block.
+
+State what changed, what ran, and what remains unproved. Outside the scoped complexity review above,
+no mandatory report template is required.

@@ -8,10 +8,12 @@ technical claims.
 1. Check Git status and preserve unrelated work.
 2. Read [`README.md`](README.md), [`docs/SCOPE.md`](docs/SCOPE.md), and
    [`docs/INDEX.md`](docs/INDEX.md).
-3. Read the direct contract, implementation, tests, and vectors for the surface you will change.
-4. Run `./scripts/format.sh`; it formats Rust and Markdown and expands Markdown tables.
-5. Choose the narrowest useful gate from [`docs/BUILD.md`](docs/BUILD.md).
-6. Follow the human workflow, style, and review guidance in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+3. Read [ADR 0001](docs/decisions/0001-kapsel-style.md) for the design criterion, then follow
+   [Contributing](CONTRIBUTING.md), including its
+   [complexity review](CONTRIBUTING.md#complexity-review).
+4. Read the direct contract, implementation, tests, and vectors for the surface you will change.
+5. Run `./scripts/format.sh`; it formats Rust and Markdown and expands Markdown tables.
+6. Choose the narrowest useful gate from [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Find technical truth
 
