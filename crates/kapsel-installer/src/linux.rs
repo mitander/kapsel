@@ -470,6 +470,10 @@ fn recover_transaction_successor(
     dead_code,
     reason = "host-file installation order is intentionally not wired in this milestone"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the crash-safe state transitions together makes their ordering reviewable"
+)]
 fn ensure_host_file(
     transaction: &mut OpenTransaction,
     spec: &HostFileSpec<'_>,
