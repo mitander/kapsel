@@ -45,7 +45,11 @@ pub(super) fn open_journal(path: &Path) -> Result<OpenedJournal, GatewayError> {
     }
     let fresh = database_identity.len() == 0;
     let initial_version = read_header_version(&mut database_file)?;
-    if !fresh && initial_version != 0 && initial_version != schema::JOURNAL_FORMAT_VERSION {
+    if !fresh
+        && initial_version != 0
+        && initial_version != 2
+        && initial_version != schema::JOURNAL_FORMAT_VERSION
+    {
         return Err(GatewayError::UnsupportedJournalVersion);
     }
     recover_private_rollback_journal(path, &database_identity)?;
@@ -57,7 +61,11 @@ pub(super) fn open_journal(path: &Path) -> Result<OpenedJournal, GatewayError> {
     }
     require_named_identity(path, &database_identity).map_err(GatewayError::JournalFile)?;
     let source_version = read_header_version(&mut database_file)?;
-    if !fresh && source_version != 0 && source_version != schema::JOURNAL_FORMAT_VERSION {
+    if !fresh
+        && source_version != 0
+        && source_version != 2
+        && source_version != schema::JOURNAL_FORMAT_VERSION
+    {
         return Err(GatewayError::UnsupportedJournalVersion);
     }
     let backup_digest = if !fresh && source_version == 0 {
@@ -92,6 +100,8 @@ pub(super) fn open_journal(path: &Path) -> Result<OpenedJournal, GatewayError> {
             fresh,
             backup_digest.as_deref(),
         )?;
+    } else if source_version == 2 {
+        schema::upgrade_v2(&mut connection)?;
     } else if !schema::recognized_supported_schema(&connection)? {
         return Err(GatewayError::InvalidPersistedState);
     }

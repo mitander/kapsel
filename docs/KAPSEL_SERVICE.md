@@ -26,12 +26,14 @@ bounded local caller
                  -> concrete Kubernetes adapter
 ```
 
-The Kapsel service retains the sole `kubernetes.set_deployment_image` capability. The exact grant
-binds one operation identity, namespace, Deployment, container, and immutable image digest. It does
-not bind a Deployment UID or resource version; the gateway reads and freezes those facts after
-submission. The [reconnectable agent action experiment](RECONNECTABLE_AGENT_ACTION.md) records why
-that late binding cannot satisfy a workflow whose operator approval must preserve exact receiver
-preconditions. `kapseld` composes `Application`; it does not sequence gateway internals.
+The Kapsel service retains the sole `kubernetes.set_deployment_image` capability. Unpublished HEAD
+requires an exact-snapshot v2 grant at startup, including restart. The grant binds the operation
+tuple and independently acquired Deployment UID/resourceVersion. Legacy grants are rejected before
+journal opening or recovery. Existing legacy handles cannot be upgraded or acquire replacement
+authority. Use the legacy CLI for their original lifecycle and offline receipt inspection.
+[Exact-snapshot approval](EFFECT_GATEWAY.md#exact-snapshot-approval-in-unpublished-head) owns the
+wire, bounds, durable compatibility and stale disposition. `kapseld` composes `Application`; it does
+not sequence gateway internals.
 
 The service process exists because the synchronous CLI and stdio MCP adapter do not provide
 caller-independent lifetime, startup reconciliation, read-only reconnect/status, exact receipt
@@ -124,11 +126,12 @@ cross-request, malformed UTF-8, oversized, timed-out, and out-of-grammar fields 
 lifecycle effect.
 
 Status returns `NOT_FOUND`, `IN_PROGRESS`, `NOT_ATTEMPTED` with its required `target_rejection`,
-`SUCCEEDED`, `FAILED`, or `UNKNOWN` without Kubernetes access. Status responses contain only
-`status`, except `NOT_ATTEMPTED`. Receipt responses are `{"status":"NOT_FOUND"}`,
-`{"status":"NOT_READY"}`, or a ready record containing only `status:"READY"`, `receipt_hex`, and
-`receipt_sha256`. The receipt is lowercase hexadecimal of exact journal-frozen bytes and retains the
-journal-frozen lowercase digest.
+`SUCCEEDED`, `FAILED`, or `UNKNOWN` without Kubernetes access. Status responses also project
+`approved_target`, `observed_target`, and `attempt_target` as null or bounded objects with `uid` and
+`resource_version` members. Missing observed members are null. `NOT_FOUND` carries no target facts.
+Receipt responses are `{"status":"NOT_FOUND"}`, `{"status":"NOT_READY"}`, or a ready record
+containing only `status:"READY"`, `receipt_hex`, and `receipt_sha256`. The receipt is lowercase
+hexadecimal of exact journal-frozen bytes and retains the journal-frozen lowercase digest.
 
 A submission that acquires the sole execution slot, matches the configured grant, and installs the
 background execution task returns `{"status":"ACCEPTED"}`. `ACCEPTED` means only that the process

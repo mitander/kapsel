@@ -10,9 +10,9 @@ use std::{
 };
 
 use kapsel::{
-    inspect_receipt, provision_exact_grant, AgentRequest, ExactAuthorization, GrantProvisioning,
-    InspectionLimits, InspectionReport, InspectionStatus, OperationReport, OperationResult,
-    ReceiptStatement,
+    inspect_receipt, provision_exact_grant, provision_snapshot_grant, AgentRequest,
+    ExactAuthorization, GrantProvisioning, InspectionLimits, InspectionReport, InspectionStatus,
+    OperationReport, OperationResult, ReceiptStatement,
 };
 use rustix::fs::{openat, Mode, OFlags, CWD};
 use serde::Deserialize;
@@ -38,7 +38,10 @@ pub(crate) fn run(arguments: impl Iterator<Item = OsString>) -> CommandResult {
         .map_err(|_| CommandError::input("kapsel"))?;
     match subcommand.as_str() {
         "--version" => version(arguments),
-        "provision-grant" => provision(parse_options("provision-grant", arguments)?),
+        "provision-grant" => provision(parse_options("provision-grant", arguments)?, false),
+        "provision-snapshot-grant" => {
+            provision(parse_options("provision-snapshot-grant", arguments)?, true)
+        },
         "operate" => operate(parse_options("operate", arguments)?),
         "inspect" => inspect(parse_options("inspect", arguments)?),
         _ => Err(CommandError::input("kapsel")),
@@ -130,20 +133,27 @@ struct RequestDocument {
     immutable_image_digest: String,
 }
 
-fn provision(mut options: BTreeMap<String, OsString>) -> CommandResult {
-    let authorization_path = take_path(&mut options, "--authorization", "provision-grant")?;
-    let seed_path = take_path(&mut options, "--signing-seed", "provision-grant")?;
-    let key_id = take_text(&mut options, "--signing-key-id", "provision-grant")?;
-    let output_path = take_path(&mut options, "--output", "provision-grant")?;
-    finish_options(&options, "provision-grant")?;
+fn provision(mut options: BTreeMap<String, OsString>, snapshot: bool) -> CommandResult {
+    let command = if snapshot {
+        "provision-snapshot-grant"
+    } else {
+        "provision-grant"
+    };
+    let kubeconfig = if snapshot {
+        Some(take_path(&mut options, "--kubeconfig", command)?)
+    } else {
+        None
+    };
+    let authorization_path = take_path(&mut options, "--authorization", command)?;
+    let seed_path = take_path(&mut options, "--signing-seed", command)?;
+    let key_id = take_text(&mut options, "--signing-key-id", command)?;
+    let output_path = take_path(&mut options, "--output", command)?;
+    finish_options(&options, command)?;
 
-    let document: AuthorizationDocument = read_json(&authorization_path, "provision-grant")?;
-    let seed = read_exact_32(
-        &seed_path,
-        "provision-grant",
-        ErrorClass::OperatorConfiguration,
-    )?;
+    let document: AuthorizationDocument = read_json(&authorization_path, command)?;
+    let seed = read_exact_32(&seed_path, command, ErrorClass::OperatorConfiguration)?;
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: document.authorization_id,
         operation_id: document.operation_id,
         namespace: document.namespace,
@@ -151,15 +161,32 @@ fn provision(mut options: BTreeMap<String, OsString>) -> CommandResult {
         container: document.container,
         immutable_image_digest: document.immutable_image_digest,
     };
-    let grant = provision_exact_grant(&GrantProvisioning {
+    let provisioning = GrantProvisioning {
         authorization: &authorization,
         signing_seed: &seed,
         signing_key_id: &key_id,
-    })
-    .map_err(|_| CommandError::input("provision-grant"))?;
+    };
+    let grant = if let Some(path) = kubeconfig {
+        let bytes = read_bounded(
+            &path,
+            JSON_BYTES_MAX,
+            command,
+            ErrorClass::OperatorConfiguration,
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| CommandError::configuration(command))?;
+        runtime.block_on(provision_snapshot_grant(&provisioning, &bytes))
+    } else {
+        provision_exact_grant(&provisioning)
+    }
+    .map_err(|_| CommandError::input(command))?;
     write_new_private(&output_path, &grant)
         .map_err(|_| CommandError::configuration("provision-grant"))?;
-    Ok(r#"{"command":"provision-grant","status":"PROVISIONED"}"#.into())
+    Ok(format!(
+        "{{\"command\":\"{command}\",\"status\":\"PROVISIONED\"}}"
+    ))
 }
 
 fn operate(mut options: BTreeMap<String, OsString>) -> CommandResult {
@@ -408,19 +435,22 @@ fn render_operation(report: &OperationReport) -> CommandResult {
     let target_rejection_json = optional_json(projection.target_rejection);
     let receipt_file_json = optional_json(projection.receipt_file);
     let receipt_digest_json = optional_json(projection.receipt_sha256);
+    let fields = transport_support::target_fields(&report.targets);
+    let target_fields = &fields[1..fields.len() - 1];
     Ok(format!(
         concat!(
             "{{\"command\":\"operate\",\"operation_id\":{operation_id_json},",
             "\"state\":\"{state}\",\"result\":{result_json},",
             "\"target_rejection\":{target_rejection_json},",
             "\"receipt_file\":{receipt_file_json},",
-            "\"receipt_sha256\":{receipt_digest_json}}}"
+            "\"receipt_sha256\":{receipt_digest_json},{target_fields}}}"
         ),
         operation_id_json = operation_id_json,
         state = projection.state,
         result_json = result_json,
         target_rejection_json = target_rejection_json,
         receipt_file_json = receipt_file_json,
+        target_fields = target_fields,
         receipt_digest_json = receipt_digest_json
     ))
 }
@@ -551,6 +581,20 @@ fn render_inspection_fields(status: &str, statement: Option<&ReceiptStatement>) 
         "result",
         &json_string(operation_result(statement.result())),
     );
+    let targets = kapsel::OperationTargets {
+        approved_target: statement.approved_target().cloned(),
+        attempt_target: Some(kapsel::ApprovedTarget {
+            uid: statement.target_uid().into(),
+            resource_version: statement.target_resource_version().into(),
+        }),
+        observed_target: Some(kapsel::ObservedTarget {
+            uid: statement.receiver_uid().map(str::to_owned),
+            resource_version: statement.observed_resource_version().map(str::to_owned),
+        }),
+    };
+    let fields = transport_support::target_fields(&targets);
+    output.push(',');
+    output.push_str(&fields[1..fields.len() - 1]);
     append_json_field(&mut output, "non_claims", &json_string(NON_CLAIMS));
     output.push('}');
     output

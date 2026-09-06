@@ -92,6 +92,7 @@ fn fixture_with_receiver(receiver_plan: ReceiverPlan) -> Fixture {
     let authorization_seed = [41_u8; 32];
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "mcp-auth-1".into(),
         operation_id: "mcp-op-1".into(),
         namespace: "demo".into(),
@@ -746,7 +747,7 @@ fn clean_eof_opens_and_reopens_the_journal_without_lifecycle_work() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         connection

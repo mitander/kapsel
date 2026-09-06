@@ -44,6 +44,7 @@
 
     fn authorization(request: &SetDeploymentImageRequest) -> ExactAuthorization {
         ExactAuthorization {
+            approved_target: None,
             authorization_id: "auth-001".into(),
             operation_id: request.operation_id.clone(),
             namespace: request.namespace.clone(),

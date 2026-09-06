@@ -346,6 +346,7 @@ fn request(case: usize) -> SetDeploymentImageRequest {
 
 fn authorization(request: &SetDeploymentImageRequest, case: usize) -> ExactAuthorization {
     ExactAuthorization {
+        approved_target: None,
         authorization_id: format!("simulation-auth-{case}"),
         operation_id: request.operation_id.clone(),
         namespace: request.namespace.clone(),

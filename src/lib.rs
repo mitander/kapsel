@@ -20,14 +20,16 @@ mod simulation_tests;
 
 pub use application::{
     open_application_from_fixed_operator_document, open_application_from_operator_document,
-    provision_exact_grant, validate_service_operator_inputs, AgentRequest, Application,
-    ApplicationError, GrantProvisioning, OperationReport, OperatorConfiguration,
-    SetDeploymentImageReceipt, SetDeploymentImageStatus, ValidatedServiceOperatorInputs,
+    provision_exact_grant, provision_snapshot_grant, validate_service_operator_inputs,
+    AgentRequest, Application, ApplicationError, GrantProvisioning, OperationReport,
+    OperatorConfiguration, SetDeploymentImageReceipt, SetDeploymentImageStatus,
+    ValidatedServiceOperatorInputs,
 };
 pub use gateway::{
-    inspect_receipt, AuthorizationTrust, ExactAuthorization, InspectionLimits, InspectionReport,
-    InspectionStatus, OperationResult, OperationState, ReceiptError, ReceiptReference,
-    ReceiptStatement, ReceiptTrust, SetDeploymentImageRequest, TargetRejection,
+    inspect_receipt, ApprovedTarget, AuthorizationTrust, ExactAuthorization, InspectionLimits,
+    InspectionReport, InspectionStatus, ObservedTarget, OperationResult, OperationState,
+    OperationTargets, ReceiptError, ReceiptReference, ReceiptStatement, ReceiptTrust,
+    SetDeploymentImageRequest, TargetRejection,
 };
 #[cfg(test)]
 use gateway::{

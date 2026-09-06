@@ -165,6 +165,19 @@ async fn open_operator_document(
         read_operator_exact_32(&mut read_file, &operator.authorization_public_key)?;
     let receipt_signing_seed =
         read_operator_exact_32(&mut read_file, &operator.receipt_signing_seed)?;
+    if fixed_state_paths.is_some() {
+        let grant = verify_authorization_grant(
+            &signed_authorization_grant,
+            &AuthorizationTrust {
+                key_id: operator.authorization_key_id.clone(),
+                public_key: authorization_public_key,
+            },
+        )
+        .map_err(|_| ApplicationError::InvalidOperatorConfiguration)?;
+        if grant.authorization.approved_target.is_none() {
+            return Err(ApplicationError::InvalidOperatorConfiguration);
+        }
+    }
     let kubeconfig = read_operator_file(&mut read_file, &operator.kubeconfig, 16 * 1024)?;
     let kubernetes_client = load_operator_kubernetes_client(&kubeconfig).await?;
 
@@ -335,6 +348,53 @@ pub fn provision_exact_grant(
     .map_err(|_| ApplicationError::InvalidGrantProvisioning)
 }
 
+/// Acquires the operator-selected Deployment version and signs one snapshot grant.
+///
+/// No snapshot fields are accepted in the proposal. Kubernetes authority is an explicit bounded
+/// kubeconfig, never ambient configuration. The production adapter owns target validation and GET
+/// deadline. This function does not mutate Kubernetes or create a journal.
+///
+/// # Errors
+///
+/// Returns a bounded configuration or provisioning failure for invalid input or failed acquisition.
+pub async fn provision_snapshot_grant(
+    provisioning: &GrantProvisioning<'_>,
+    kubeconfig: &[u8],
+) -> Result<Vec<u8>, ApplicationError> {
+    use crate::gateway::{
+        ApprovedTarget, DeploymentImageAdapter, KubernetesDeploymentImageAdapter,
+    };
+    if kubeconfig.len() > 16 * 1024 || provisioning.authorization.approved_target.is_some() {
+        return Err(ApplicationError::InvalidGrantProvisioning);
+    }
+    // Validate the entire proposal and signer before network access. These bytes are not published.
+    provision_exact_grant(provisioning)?;
+    let client = load_operator_kubernetes_client(kubeconfig).await?;
+    let mut adapter = KubernetesDeploymentImageAdapter::new(client);
+    let proposal = provisioning.authorization;
+    let request = AgentRequest {
+        operation_id: proposal.operation_id.clone(),
+        namespace: proposal.namespace.clone(),
+        deployment: proposal.deployment.clone(),
+        container: proposal.container.clone(),
+        immutable_image_digest: proposal.immutable_image_digest.clone(),
+    };
+    let observed = adapter
+        .identify(&request)
+        .await
+        .map_err(|_| ApplicationError::InvalidGrantProvisioning)?;
+    let mut authorization = proposal.clone();
+    authorization.approved_target = Some(ApprovedTarget {
+        uid: observed.deployment_uid,
+        resource_version: observed.resource_version,
+    });
+    provision_exact_grant(&GrantProvisioning {
+        authorization: &authorization,
+        signing_seed: provisioning.signing_seed,
+        signing_key_id: provisioning.signing_key_id,
+    })
+}
+
 /// Application-level report shared by the local CLI and fixed MCP adapters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationReport {
@@ -348,6 +408,8 @@ pub struct OperationReport {
     pub target_rejection: Option<TargetRejection>,
     /// Frozen receipt reference, present only after finalization.
     pub receipt: Option<ReceiptReference>,
+    /// Distinct durable approval, observation and mutation-precondition facts.
+    pub targets: crate::OperationTargets,
 }
 
 /// Read-only exact receipt projection for the configured Deployment image operation.
@@ -469,13 +531,32 @@ impl Application {
         &self,
         operation_id: &str,
     ) -> Result<SetDeploymentImageStatus, ApplicationError> {
+        self.read_set_deployment_image_status_with_targets(operation_id)
+            .map(|(status, _)| status)
+    }
+
+    /// Reads disposition and target facts from one authority-checked SQLite snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded operation failure for inconsistent or inaccessible durable state.
+    pub fn read_set_deployment_image_status_with_targets(
+        &self,
+        operation_id: &str,
+    ) -> Result<(SetDeploymentImageStatus, crate::OperationTargets), ApplicationError> {
         if operation_id != self.authorized_request.operation_id {
-            return Ok(SetDeploymentImageStatus::NotFound);
+            return Ok((
+                SetDeploymentImageStatus::NotFound,
+                crate::OperationTargets::default(),
+            ));
         }
         let Some(report) = self.report()? else {
-            return Ok(SetDeploymentImageStatus::NotFound);
+            return Ok((
+                SetDeploymentImageStatus::NotFound,
+                crate::OperationTargets::default(),
+            ));
         };
-        match report.state {
+        let status = match report.state {
             OperationState::Requested
             | OperationState::Authorized
             | OperationState::ApplyStarted
@@ -492,7 +573,8 @@ impl Application {
                 Some(OperationResult::Unknown) => Ok(SetDeploymentImageStatus::Unknown),
                 None => Err(ApplicationError::OperationFailure),
             },
-        }
+        }?;
+        Ok((status, report.targets))
     }
 
     /// Reads the exact finalized receipt for the configured Deployment image operation.
@@ -661,6 +743,7 @@ impl Application {
             result: snapshot.result(),
             target_rejection: snapshot.target_rejection(),
             receipt: snapshot.receipt_reference(),
+            targets: snapshot.targets(),
         }))
     }
 

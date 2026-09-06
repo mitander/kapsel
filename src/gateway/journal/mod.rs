@@ -49,6 +49,8 @@ pub(crate) struct OperationStateProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::gateway) struct RequestFacts {
+    approved_target: Option<super::ApprovedTarget>,
+    preflight_target: Option<super::ApprovedTarget>,
     request: ValidatedRequest,
 }
 
@@ -167,6 +169,10 @@ impl AuthorizedOperation {
     pub(in crate::gateway) fn request(&self) -> &ValidatedRequest {
         &self.request.request
     }
+
+    pub(in crate::gateway) fn approved_target(&self) -> Option<&super::ApprovedTarget> {
+        self.request.approved_target.as_ref()
+    }
 }
 
 impl ApplyStartedOperation {
@@ -259,6 +265,88 @@ impl LoadedOperation {
         }
     }
 
+    fn request_facts(&self) -> &RequestFacts {
+        match self {
+            Self::Requested(v) => &v.request,
+            Self::Authorized(v) => &v.request,
+            Self::NotAttempted(v) => &v.authorized.request,
+            Self::ApplyStarted(v) => &v.authorized.request,
+            Self::ReceiverObserved(v) => &v.apply_started.authorized.request,
+            Self::ReceiptPrepared(v) => &v.receiver_observed.apply_started.authorized.request,
+            Self::ReceiptWritten(v) => {
+                &v.receipt_prepared
+                    .receiver_observed
+                    .apply_started
+                    .authorized
+                    .request
+            },
+            Self::Finalized(v) => {
+                &v.receipt_written
+                    .receipt_prepared
+                    .receiver_observed
+                    .apply_started
+                    .authorized
+                    .request
+            },
+        }
+    }
+
+    pub(crate) fn targets(&self) -> super::OperationTargets {
+        let request = self.request_facts();
+        let attempt = match self {
+            Self::ApplyStarted(v) => Some(&v.attempt),
+            Self::ReceiverObserved(v) => Some(&v.apply_started.attempt),
+            Self::ReceiptPrepared(v) => Some(&v.receiver_observed.apply_started.attempt),
+            Self::ReceiptWritten(v) => {
+                Some(&v.receipt_prepared.receiver_observed.apply_started.attempt)
+            },
+            Self::Finalized(v) => Some(
+                &v.receipt_written
+                    .receipt_prepared
+                    .receiver_observed
+                    .apply_started
+                    .attempt,
+            ),
+            Self::Requested(_) | Self::Authorized(_) | Self::NotAttempted(_) => None,
+        };
+        let statement = match self {
+            Self::ReceiverObserved(v) => Some(v.statement()),
+            Self::ReceiptPrepared(v) => Some(v.receiver_observed.statement()),
+            Self::ReceiptWritten(v) => Some(v.receipt_prepared.receiver_observed.statement()),
+            Self::Finalized(v) => Some(
+                v.receipt_written
+                    .receipt_prepared
+                    .receiver_observed
+                    .statement(),
+            ),
+            _ => None,
+        };
+        super::OperationTargets {
+            approved_target: request.approved_target.clone(),
+            attempt_target: attempt.map(|v| super::ApprovedTarget {
+                uid: v.target.deployment_uid().to_owned(),
+                resource_version: v.target.resource_version().to_owned(),
+            }),
+            observed_target: statement.map_or_else(
+                || {
+                    request
+                        .preflight_target
+                        .as_ref()
+                        .map(|v| super::ObservedTarget {
+                            uid: Some(v.uid.clone()),
+                            resource_version: Some(v.resource_version.clone()),
+                        })
+                },
+                |statement| {
+                    Some(super::ObservedTarget {
+                        uid: statement.receiver_uid.clone(),
+                        resource_version: statement.observed_resource_version.clone(),
+                    })
+                },
+            ),
+        }
+    }
+
     pub(crate) fn result(&self) -> Option<OperationResult> {
         match self {
             Self::ReceiverObserved(value) => Some(value.receiver.statement.result),
@@ -319,6 +407,10 @@ impl LoadedOperation {
 }
 
 struct SnapshotRow {
+    approved_uid: Option<String>,
+    approved_resource_version: Option<String>,
+    preflight_uid: Option<String>,
+    preflight_resource_version: Option<String>,
     operation_id: String,
     namespace: String,
     deployment: String,
@@ -356,7 +448,20 @@ impl SnapshotRow {
         let state = OperationState::from_sql(&self.state)?;
         let apply_attempted = decode_sql_bool(self.apply_attempted)?;
         let apply_accepted = self.apply_accepted.map(decode_sql_bool).transpose()?;
+        let approved_target = snapshot_target(self.approved_uid, self.approved_resource_version)?;
+        let preflight_target =
+            snapshot_target(self.preflight_uid, self.preflight_resource_version)?;
+        if preflight_target.is_some()
+            && matches!(
+                state,
+                OperationState::Requested | OperationState::Authorized
+            )
+        {
+            return Err(GatewayError::InvalidPersistedState);
+        }
         let request = RequestFacts {
+            approved_target,
+            preflight_target,
             request: ValidatedRequest::try_from(&SetDeploymentImageRequest {
                 operation_id: self.operation_id,
                 namespace: self.namespace,
@@ -388,6 +493,30 @@ impl SnapshotRow {
             self.requested_generation,
             self.apply_resource_version,
         )?;
+        if let Some(approved) = &request.approved_target {
+            if authorization.is_none()
+                || attempt.as_ref().is_some_and(|attempt| {
+                    attempt.target.deployment_uid() != approved.uid
+                        || attempt.target.resource_version() != approved.resource_version
+                })
+                || (attempt.is_some() && request.preflight_target.as_ref() != Some(approved))
+            {
+                return Err(GatewayError::InvalidPersistedState);
+            }
+        }
+        if rejection == Some(TargetRejection::StaleApproval)
+            && (request.approved_target.is_none()
+                || request.preflight_target.is_none()
+                || request.approved_target == request.preflight_target)
+        {
+            return Err(GatewayError::InvalidPersistedState);
+        }
+        if state == OperationState::NotAttempted
+            && rejection != Some(TargetRejection::StaleApproval)
+            && request.preflight_target.is_some()
+        {
+            return Err(GatewayError::InvalidPersistedState);
+        }
         if statement.as_ref().map(|value| value.result) != result {
             return Err(GatewayError::InvalidPersistedState);
         }
@@ -404,7 +533,6 @@ impl SnapshotRow {
         match state {
             OperationState::Requested
                 if !apply_attempted
-                    && authorization.is_none()
                     && rejection.is_none()
                     && attempt.is_none()
                     && result.is_none()
@@ -673,6 +801,7 @@ impl TargetRejection {
             Self::DeploymentNotFound => "deployment_not_found",
             Self::ContainerNotFound => "container_not_found",
             Self::InvalidTarget => "invalid_target",
+            Self::StaleApproval => "stale_approval",
         }
     }
 
@@ -681,6 +810,7 @@ impl TargetRejection {
             "deployment_not_found" => Ok(Self::DeploymentNotFound),
             "container_not_found" => Ok(Self::ContainerNotFound),
             "invalid_target" => Ok(Self::InvalidTarget),
+            "stale_approval" => Ok(Self::StaleApproval),
             _ => Err(GatewayError::InvalidPersistedState),
         }
     }
@@ -760,8 +890,11 @@ impl Journal {
 
     pub(in crate::gateway) fn insert_requested(
         &self,
-        request: &ValidatedRequest,
+        authorized: &AuthorizedRequest,
     ) -> Result<(), GatewayError> {
+        let request = authorized.request();
+        let authority = authorized.authorization();
+        let approved = authority.authorization.approved_target.as_ref();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(GatewayError::Database)?;
@@ -779,8 +912,10 @@ impl Journal {
             .execute(
                 "INSERT INTO kubernetes_image_operations (
                     operation_id, namespace, deployment, container,
-                    immutable_image_digest, state
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    immutable_image_digest, state, authorization_id,
+                    authorization_signer_key_id, authorization_grant_digest,
+                    approved_uid, approved_resource_version
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     request.operation_id(),
                     request.namespace(),
@@ -788,6 +923,11 @@ impl Journal {
                     request.container(),
                     request.immutable_image_digest(),
                     OperationState::Requested.as_sql(),
+                    authority.authorization.authorization_id,
+                    authority.signer_key_id,
+                    authority.grant_digest,
+                    approved.map(|target| target.uid.as_str()),
+                    approved.map(|target| target.resource_version.as_str()),
                 ],
             )
             .map_err(GatewayError::Database)?;
@@ -799,7 +939,10 @@ impl Journal {
         operation: &RequestedOperation,
         authorized: &AuthorizedRequest,
     ) -> Result<(), GatewayError> {
-        if operation.request() != authorized.request() {
+        if operation.request() != authorized.request()
+            || existing_submission_on(&self.connection, authorized)?
+                != Some(OperationState::Requested)
+        {
             return Err(GatewayError::InvalidTransition);
         }
         let operation_id = operation.request().operation_id();
@@ -1105,6 +1248,52 @@ impl Journal {
         changed_one(changed)
     }
 
+    pub(in crate::gateway) fn begin_attempt(
+        &self,
+        operation: &AuthorizedOperation,
+        observed: ValidatedTargetIdentity,
+    ) -> Result<Option<ValidatedTargetIdentity>, GatewayError> {
+        let target = if let Some(approved) = operation.approved_target() {
+            if observed.deployment_uid() != approved.uid
+                || observed.resource_version() != approved.resource_version
+            {
+                self.mark_stale_approval(operation, &observed)?;
+                return Ok(None);
+            }
+            ValidatedTargetIdentity::try_from(TargetIdentity {
+                deployment_uid: approved.uid.clone(),
+                resource_version: approved.resource_version.clone(),
+            })
+            .map_err(|_| GatewayError::InvalidPersistedState)?
+        } else {
+            observed
+        };
+        self.mark_apply_started(operation, &target)?;
+        Ok(Some(target))
+    }
+
+    pub(in crate::gateway) fn mark_stale_approval(
+        &self,
+        operation: &AuthorizedOperation,
+        observed: &ValidatedTargetIdentity,
+    ) -> Result<(), GatewayError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE kubernetes_image_operations SET state = 'not_attempted',
+                target_rejection = 'stale_approval', apply_attempted = 0,
+                preflight_uid = ?1, preflight_resource_version = ?2
+             WHERE operation_id = ?3 AND state = 'authorized'",
+                params![
+                    observed.deployment_uid(),
+                    observed.resource_version(),
+                    operation.request().operation_id()
+                ],
+            )
+            .map_err(GatewayError::Database)?;
+        changed_one(changed)
+    }
+
     pub(in crate::gateway) fn mark_apply_started(
         &self,
         operation: &AuthorizedOperation,
@@ -1116,7 +1305,8 @@ impl Journal {
             .execute(
                 "UPDATE kubernetes_image_operations
                  SET state = ?1, write_strategy = ?2, apply_attempted = 1,
-                     target_uid = ?3, target_resource_version = ?4
+                     target_uid = ?3, target_resource_version = ?4,
+                     preflight_uid = ?3, preflight_resource_version = ?4
                  WHERE operation_id = ?5 AND state = ?6",
                 params![
                     OperationState::ApplyStarted.as_sql(),
@@ -1272,7 +1462,13 @@ fn existing_submission_on(
         return Err(GatewayError::OperationIdentityConflict);
     }
     let state = OperationState::from_sql(&state)?;
-    if state != OperationState::Requested
+    if state == OperationState::Requested
+        && authorization_id.is_none()
+        && authorization.authorization.approved_target.is_some()
+    {
+        return Err(GatewayError::OperationIdentityConflict);
+    }
+    if (state != OperationState::Requested || authorization_id.is_some())
         && (authorization_id.as_deref()
             != Some(authorization.authorization.authorization_id.as_str())
             || authorization_signer_key_id.as_deref() != Some(authorization.signer_key_id.as_str())
@@ -1282,6 +1478,9 @@ fn existing_submission_on(
     }
     let loaded = loaded_operation_on(connection, request.operation_id())?
         .ok_or(GatewayError::InvalidPersistedState)?;
+    if loaded.request_facts().approved_target != authorization.authorization.approved_target {
+        return Err(GatewayError::OperationIdentityConflict);
+    }
     if loaded.state() != state {
         return Err(GatewayError::InvalidPersistedState);
     }
@@ -1312,12 +1511,18 @@ fn snapshot_row_on(
                         OR rollout_condition_type IS NOT NULL
                         OR rollout_condition_status IS NOT NULL
                         OR rollout_condition_reason IS NOT NULL,
-                    receipt_path, receipt_digest, receipt_bytes, receipt_key_id
+                    receipt_path, receipt_digest, receipt_bytes, receipt_key_id,
+                    approved_uid, approved_resource_version,
+                    preflight_uid, preflight_resource_version
              FROM kubernetes_image_operations
              WHERE operation_id = ?1",
             [operation_id],
             |row| {
                 Ok(SnapshotRow {
+                    approved_uid: row.get(23)?,
+                    approved_resource_version: row.get(24)?,
+                    preflight_uid: row.get(25)?,
+                    preflight_resource_version: row.get(26)?,
                     operation_id: row.get(0)?,
                     namespace: row.get(1)?,
                     deployment: row.get(2)?,
@@ -1362,7 +1567,7 @@ fn receipt_statement_on(
                     observed_generation, receiver_resource_version, desired_replicas,
                     updated_replicas, available_replicas, unavailable_replicas,
                     rollout_condition_type, rollout_condition_status,
-                    rollout_condition_reason, result
+                    rollout_condition_reason, result, approved_uid, approved_resource_version
              FROM kubernetes_image_operations
              WHERE operation_id = ?1 AND state IN (?2, ?3, ?4, ?5)",
             params![
@@ -1389,6 +1594,26 @@ fn loaded_operation_on(
     };
     let statement = receipt_statement_on(connection, operation_id)?;
     row.into_operation(statement).map(Some)
+}
+
+fn snapshot_target(
+    uid: Option<String>,
+    resource_version: Option<String>,
+) -> Result<Option<super::ApprovedTarget>, GatewayError> {
+    match (uid, resource_version) {
+        (None, None) => Ok(None),
+        (Some(uid), Some(resource_version)) => {
+            let target = super::ApprovedTarget {
+                uid,
+                resource_version,
+            };
+            if !target.is_valid() {
+                return Err(GatewayError::InvalidPersistedState);
+            }
+            Ok(Some(target))
+        },
+        _ => Err(GatewayError::InvalidPersistedState),
+    }
 }
 
 fn decode_sql_bool(value: i64) -> Result<bool, GatewayError> {
@@ -1475,6 +1700,8 @@ fn validate_frozen_receipt(receipt: FrozenReceipt) -> Result<FrozenReceipt, Gate
 }
 
 struct ReceiptRow {
+    approved_uid: Option<String>,
+    approved_resource_version: Option<String>,
     operation_id: String,
     authorization_id: Option<String>,
     authorization_signer_key_id: Option<String>,
@@ -1506,6 +1733,8 @@ struct ReceiptRow {
 impl ReceiptRow {
     fn from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
+            approved_uid: row.get(26)?,
+            approved_resource_version: row.get(27)?,
             operation_id: row.get(0)?,
             authorization_id: row.get(1)?,
             authorization_signer_key_id: row.get(2)?,
@@ -1537,6 +1766,7 @@ impl ReceiptRow {
 
     fn into_statement(self) -> Result<ReceiptStatement, GatewayError> {
         let statement = ReceiptStatement {
+            approved_target: snapshot_target(self.approved_uid, self.approved_resource_version)?,
             operation_id: self.operation_id,
             authorization_id: self
                 .authorization_id
@@ -1617,6 +1847,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         ReceiptStatement {
+            approved_target: None,
             operation_id: "snapshot-op".into(),
             authorization_id: "snapshot-auth".into(),
             authorization_signer_key_id: "snapshot-signer".into(),
@@ -2270,6 +2501,7 @@ mod tests {
             .into(),
         };
         let authorization = ExactAuthorization {
+            approved_target: None,
             authorization_id: "snapshot-auth".into(),
             operation_id: request.operation_id.clone(),
             namespace: request.namespace.clone(),
@@ -2292,7 +2524,7 @@ mod tests {
         let authorized =
             AuthorizedRequest::bind(ValidatedRequest::try_from(&request).unwrap(), verified)
                 .unwrap();
-        journal.insert_requested(authorized.request()).unwrap();
+        journal.insert_requested(&authorized).unwrap();
         let other = Journal::open(root.join("journal.sqlite3")).unwrap();
 
         let snapshot = journal
@@ -2332,6 +2564,7 @@ mod tests {
             .into(),
         };
         let authorization = ExactAuthorization {
+            approved_target: None,
             authorization_id: "snapshot-auth".into(),
             operation_id: request.operation_id.clone(),
             namespace: request.namespace.clone(),

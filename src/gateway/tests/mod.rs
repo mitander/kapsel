@@ -47,3 +47,8 @@ mod v011_upgrade {
 
     include!("v011_upgrade.rs");
 }
+
+mod snapshot_approval {
+    use super::*;
+    include!("snapshot.rs");
+}

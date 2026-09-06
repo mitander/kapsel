@@ -37,6 +37,7 @@ fn request() -> AgentRequest {
 
 fn authorization(request: &AgentRequest) -> ExactAuthorization {
     ExactAuthorization {
+        approved_target: None,
         authorization_id: "application-auth-1".into(),
         operation_id: request.operation_id.clone(),
         namespace: request.namespace.clone(),
@@ -741,8 +742,13 @@ async fn fixed_operator_document_composes_the_existing_application_grammar() {
     let request = request();
     let authorization_seed = [91_u8; 32];
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
+    let mut approved = authorization(&request);
+    approved.approved_target = Some(kapsel::ApprovedTarget {
+        uid: "uid".into(),
+        resource_version: "rv".into(),
+    });
     let grant = provision_exact_grant(&GrantProvisioning {
-        authorization: &authorization(&request),
+        authorization: &approved,
         signing_seed: &authorization_seed,
         signing_key_id: "owner-key",
     })

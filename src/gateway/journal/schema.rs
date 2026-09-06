@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use super::{GatewayError, OPERATION_COUNT_MAX};
 use crate::gateway::receipt::RECEIPT_BYTES_MAX;
 
-pub(super) const JOURNAL_FORMAT_VERSION: u32 = 2;
+pub(super) const JOURNAL_FORMAT_VERSION: u32 = 3;
 
 pub(super) const PERSISTED_VALUE_BYTES_MAX: usize = 16 * 1024;
 pub(super) const PERSISTED_ROW_BYTES_MAX: i32 = 64 * 1024;
@@ -255,6 +255,7 @@ pub(super) fn initialize_schema(
     } else {
         return Err(GatewayError::InvalidPersistedState);
     }
+    add_snapshot_columns(transaction)?;
     require_persisted_bounds(transaction)
 }
 
@@ -274,22 +275,67 @@ pub(super) fn require_integrity(transaction: &Transaction<'_>) -> Result<(), Gat
     }
 }
 
-pub(super) fn recognized_supported_schema(connection: &Connection) -> Result<bool, GatewayError> {
-    let recognized = recognized_schema(connection, CURRENT_COLUMNS, CREATE_OPERATION_TABLE)?
-        || recognized_schema(
-            connection,
+const SNAPSHOT_COLUMNS: &[&str] = &[
+    "approved_uid",
+    "approved_resource_version",
+    "preflight_uid",
+    "preflight_resource_version",
+];
+
+fn add_snapshot_columns(connection: &Connection) -> Result<(), GatewayError> {
+    for column in SNAPSHOT_COLUMNS {
+        connection
+            .execute(
+                &format!("ALTER TABLE kubernetes_image_operations ADD COLUMN {column} TEXT"),
+                [],
+            )
+            .map_err(GatewayError::Database)?;
+    }
+    Ok(())
+}
+
+pub(super) fn upgrade_v2(connection: &mut Connection) -> Result<(), GatewayError> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+        .map_err(GatewayError::Database)?;
+    if !recognized_schema(&transaction, CURRENT_COLUMNS, CREATE_OPERATION_TABLE)?
+        && !recognized_schema(
+            &transaction,
             MIGRATED_LEGACY_COLUMNS,
             MIGRATED_LEGACY_OPERATION_TABLE,
-        )?;
-    if recognized {
-        require_persisted_bounds(connection)?;
+        )?
+    {
+        return Err(GatewayError::InvalidPersistedState);
     }
-    Ok(recognized)
+    require_integrity(&transaction)?;
+    add_snapshot_columns(&transaction)?;
+    require_persisted_bounds(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", JOURNAL_FORMAT_VERSION)
+        .map_err(GatewayError::Database)?;
+    transaction.commit().map_err(GatewayError::Database)
+}
+
+pub(super) fn recognized_supported_schema(connection: &Connection) -> Result<bool, GatewayError> {
+    for (columns, sql) in [
+        (CURRENT_COLUMNS, CREATE_OPERATION_TABLE),
+        (MIGRATED_LEGACY_COLUMNS, MIGRATED_LEGACY_OPERATION_TABLE),
+    ] {
+        let columns = [columns, SNAPSHOT_COLUMNS].concat();
+        let additions = format!(", {} TEXT", SNAPSHOT_COLUMNS.join(" TEXT, "));
+        let sql = sql.replace("\n) STRICT;", &format!("{additions}\n) STRICT;"));
+        if recognized_schema(connection, &columns, &sql)? {
+            require_persisted_bounds(connection)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn require_persisted_bounds(connection: &Connection) -> Result<(), GatewayError> {
     let value_predicates = CURRENT_COLUMNS
         .iter()
+        .chain(SNAPSHOT_COLUMNS.iter())
         .filter(|name| expected_column_type(name) != "INTEGER")
         .map(|name| format!("COALESCE(length(CAST({name} AS BLOB)), 0) > ?2"))
         .collect::<Vec<_>>()

@@ -195,6 +195,7 @@ fn fixture_with_plan(successful: bool, transient_first: bool) -> Fixture {
     let authorization_seed = [41_u8; 32];
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "command-auth-1".into(),
         operation_id: "command-op-1".into(),
         namespace: "demo".into(),
@@ -301,7 +302,9 @@ fn exact_request_uses_separately_supplied_operator_configuration() {
             "{\"command\":\"operate\",\"operation_id\":\"command-op-1\",",
             "\"state\":\"NOT_ATTEMPTED\",\"result\":null,",
             "\"target_rejection\":\"DEPLOYMENT_NOT_FOUND\",",
-            "\"receipt_file\":null,\"receipt_sha256\":null}\n"
+            "\"receipt_file\":null,\"receipt_sha256\":null,",
+            "\"approved_target\":null,\"attempt_target\":null,",
+            "\"observed_target\":null}\n"
         )
     );
     assert!(output.stderr.is_empty());
@@ -325,9 +328,14 @@ fn exact_request_uses_separately_supplied_operator_configuration() {
     assert!(String::from_utf8(restarted.stdout)
         .unwrap()
         .contains("\"state\":\"NOT_ATTEMPTED\""));
+    assert_unrelated_grant_cannot_replace_journal_authority(&fixture);
+}
 
+/// A different grant must not adopt the durable operation's original authority.
+fn assert_unrelated_grant_cannot_replace_journal_authority(fixture: &Fixture) {
     let mut unrelated = fixture_with_receiver(false);
     let unrelated_authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "unrelated-auth".into(),
         operation_id: "unrelated-op".into(),
         namespace: "demo".into(),

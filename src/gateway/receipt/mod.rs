@@ -19,6 +19,9 @@ use super::{
 
 const STATEMENT_MAGIC: &[u8] = b"KAPSEL-KAP0038-K8S-STATEMENT-V2\0";
 const RECEIPT_MAGIC: &[u8] = b"KAPSEL-KAP0038-K8S-RECEIPT-V2\0";
+const SNAPSHOT_STATEMENT_MAGIC: &[u8] = b"KAPSEL-KAP0038-K8S-STATEMENT-V3\0";
+const SNAPSHOT_RECEIPT_MAGIC: &[u8] = b"KAPSEL-KAP0038-K8S-RECEIPT-V3\0";
+const SNAPSHOT_PURPOSE: &str = "kapsel.kap0038.kubernetes-effect-receipt.v3";
 const PURPOSE: &str = "kapsel.kap0038.kubernetes-effect-receipt.v2";
 const NON_CLAIMS: &str = concat!(
     "no-exactly-once;no-causation;no-kubernetes-truth;",
@@ -37,6 +40,7 @@ const _: () = assert!(STATEMENT_BYTES_MAX < RECEIPT_BYTES_MAX);
 /// Read-only classifier inputs authenticated by a successfully parsed receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReceiptStatement {
+    pub(in crate::gateway) approved_target: Option<super::ApprovedTarget>,
     pub(in crate::gateway) operation_id: String,
     pub(in crate::gateway) authorization_id: String,
     pub(in crate::gateway) authorization_signer_key_id: String,
@@ -66,6 +70,11 @@ pub struct ReceiptStatement {
 }
 
 impl ReceiptStatement {
+    /// Returns the signed approved object version, absent for legacy receipts.
+    pub fn approved_target(&self) -> Option<&super::ApprovedTarget> {
+        self.approved_target.as_ref()
+    }
+
     /// Returns the stable local operation identity.
     pub fn operation_id(&self) -> &str {
         &self.operation_id
@@ -202,10 +211,18 @@ impl ReceiptStatement {
         NON_CLAIMS
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fixed ordered receipt fields form one canonical codec"
+    )]
     pub(super) fn encode(&self) -> Result<Vec<u8>, ReceiptError> {
         self.validate()?;
         let mut output = Vec::with_capacity(1536);
-        output.extend_from_slice(STATEMENT_MAGIC);
+        output.extend_from_slice(if self.approved_target.is_some() {
+            SNAPSHOT_STATEMENT_MAGIC
+        } else {
+            STATEMENT_MAGIC
+        });
         for (tag, value) in [
             (1, self.operation_id.as_str()),
             (2, self.authorization_id.as_str()),
@@ -302,14 +319,33 @@ impl ReceiptStatement {
             STATEMENT_BYTES_MAX,
         )?;
         push(&mut output, 27, NON_CLAIMS.as_bytes(), STATEMENT_BYTES_MAX)?;
+        if let Some(approved) = &self.approved_target {
+            push_text(&mut output, 28, &approved.uid, STATEMENT_BYTES_MAX)?;
+            push_text(
+                &mut output,
+                29,
+                &approved.resource_version,
+                STATEMENT_BYTES_MAX,
+            )?;
+        }
         Ok(output)
     }
 
     fn parse(input: &[u8], limits: InspectionLimits) -> Result<Self, ReceiptError> {
         limits.validate()?;
         bounded(input, limits.statement_bytes_max)?;
-        let mut records = Records::new(input, STATEMENT_MAGIC, limits.text_bytes_max)?;
-        let statement = Self {
+        let snapshot = input.starts_with(SNAPSHOT_STATEMENT_MAGIC);
+        let mut records = Records::new(
+            input,
+            if snapshot {
+                SNAPSHOT_STATEMENT_MAGIC
+            } else {
+                STATEMENT_MAGIC
+            },
+            limits.text_bytes_max,
+        )?;
+        let mut statement = Self {
+            approved_target: None,
             operation_id: records.text(1)?,
             authorization_id: records.text(2)?,
             authorization_signer_key_id: records.text(3)?,
@@ -340,6 +376,12 @@ impl ReceiptStatement {
         if records.take(27)? != NON_CLAIMS.as_bytes() {
             return Err(ReceiptError::InvalidValue);
         }
+        if snapshot {
+            statement.approved_target = Some(super::ApprovedTarget {
+                uid: records.text(28)?,
+                resource_version: records.text(29)?,
+            });
+        }
         records.finish()?;
         statement.validate()?;
         Ok(statement)
@@ -356,6 +398,13 @@ impl ReceiptStatement {
                 .map_err(|_| ReceiptError::InvalidValue)?;
         }
         validate_digest(&self.authorization_grant_digest)?;
+        if self.approved_target.as_ref().is_some_and(|target| {
+            !target.is_valid()
+                || target.uid != self.target_uid
+                || target.resource_version != self.target_resource_version
+        }) {
+            return Err(ReceiptError::InvalidValue);
+        }
         validate_dns_label(InputField::Namespace, &self.namespace)
             .map_err(|_| ReceiptError::InvalidValue)?;
         validate_dns_subdomain(InputField::Deployment, &self.deployment)
@@ -501,9 +550,18 @@ pub(crate) fn sign_statement(
 fn sign_statement_bytes(statement_bytes: &[u8], seed: &[u8; 32], key_id: &str) -> Vec<u8> {
     let signature = SigningKey::from_bytes(seed).sign(&signature_input(statement_bytes));
     let mut output = Vec::with_capacity(statement_bytes.len() + 160);
-    output.extend_from_slice(RECEIPT_MAGIC);
-    push(&mut output, 1, PURPOSE.as_bytes(), RECEIPT_BYTES_MAX)
-        .unwrap_or_else(|_| unreachable!("validated receipt purpose fits the receipt bound"));
+    output.extend_from_slice(if statement_bytes.starts_with(SNAPSHOT_STATEMENT_MAGIC) {
+        SNAPSHOT_RECEIPT_MAGIC
+    } else {
+        RECEIPT_MAGIC
+    });
+    push(
+        &mut output,
+        1,
+        statement_purpose(statement_bytes).as_bytes(),
+        RECEIPT_BYTES_MAX,
+    )
+    .unwrap_or_else(|_| unreachable!("validated receipt purpose fits the receipt bound"));
     push_text(&mut output, 2, key_id, RECEIPT_BYTES_MAX)
         .unwrap_or_else(|_| unreachable!("validated receipt key ID fits the receipt bound"));
     push(&mut output, 3, statement_bytes, RECEIPT_BYTES_MAX)
@@ -527,15 +585,27 @@ fn parse_receipt_envelope(
 ) -> Result<ReceiptEnvelope<'_>, ReceiptError> {
     limits.validate()?;
     bounded(receipt, limits.receipt_bytes_max)?;
-    let mut records = Records::new(receipt, RECEIPT_MAGIC, limits.text_bytes_max)?;
+    let snapshot = receipt.starts_with(SNAPSHOT_RECEIPT_MAGIC);
+    let mut records = Records::new(
+        receipt,
+        if snapshot {
+            SNAPSHOT_RECEIPT_MAGIC
+        } else {
+            RECEIPT_MAGIC
+        },
+        limits.text_bytes_max,
+    )?;
     let purpose = records.text(1)?;
-    if purpose != PURPOSE {
+    if purpose != if snapshot { SNAPSHOT_PURPOSE } else { PURPOSE } {
         return Err(ReceiptError::InvalidValue);
     }
     let key_id = records.text(2)?;
     validate_key_id(&key_id)?;
     let statement_bytes = records.take(3)?;
     let statement = ReceiptStatement::parse(statement_bytes, limits)?;
+    if statement.approved_target.is_some() != snapshot {
+        return Err(ReceiptError::InvalidValue);
+    }
     let signature = Signature::from_bytes(&array(records.take(4)?)?);
     records.finish()?;
     Ok(ReceiptEnvelope {
@@ -741,9 +811,17 @@ impl OperationResult {
     }
 }
 
+fn statement_purpose(statement: &[u8]) -> &'static str {
+    if statement.starts_with(SNAPSHOT_STATEMENT_MAGIC) {
+        SNAPSHOT_PURPOSE
+    } else {
+        PURPOSE
+    }
+}
+
 fn signature_input(statement: &[u8]) -> Vec<u8> {
     let mut input = Vec::with_capacity(PURPOSE.len() + 1 + statement.len());
-    input.extend_from_slice(PURPOSE.as_bytes());
+    input.extend_from_slice(statement_purpose(statement).as_bytes());
     input.push(0);
     input.extend_from_slice(statement);
     input
@@ -980,6 +1058,7 @@ mod tests {
 
     fn statement() -> ReceiptStatement {
         ReceiptStatement {
+            approved_target: None,
             operation_id: "op-001".into(),
             authorization_id: "auth-001".into(),
             authorization_signer_key_id: "kap0038-authorization-test-key".into(),

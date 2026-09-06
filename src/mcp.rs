@@ -506,18 +506,21 @@ fn render_report(report: &OperationReport) -> Result<String, FailureClass> {
     let receipt_digest_json = projection
         .receipt_sha256
         .map_or_else(|| String::from("null"), json_text);
+    let fields = transport_support::target_fields(&report.targets);
+    let target_fields = &fields[1..fields.len() - 1];
     Ok(format!(
         concat!(
             "{{\"operation_id\":{operation_id_json},\"state\":\"{state}\",",
             "\"result\":{result_json},\"target_rejection\":{target_rejection_json},",
             "\"receipt_file\":{receipt_file_json},",
-            "\"receipt_sha256\":{receipt_digest_json}}}"
+            "\"receipt_sha256\":{receipt_digest_json},{target_fields}}}"
         ),
         operation_id_json = operation_id_json,
         state = projection.state,
         result_json = result_json,
         target_rejection_json = target_rejection_json,
         receipt_file_json = receipt_file_json,
+        target_fields = target_fields,
         receipt_digest_json = receipt_digest_json
     ))
 }

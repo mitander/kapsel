@@ -28,12 +28,27 @@ const CONNECTIONS_MAX: usize = 8;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 
 trait ApplicationReads: Send {
+    fn status_with_targets(
+        &self,
+        operation_id: &str,
+    ) -> Result<(SetDeploymentImageStatus, kapsel::OperationTargets), ApplicationError> {
+        self.status(operation_id)
+            .map(|status| (status, kapsel::OperationTargets::default()))
+    }
+
     fn status(&self, operation_id: &str) -> Result<SetDeploymentImageStatus, ApplicationError>;
 
     fn receipt(&self, operation_id: &str) -> Result<SetDeploymentImageReceipt, ApplicationError>;
 }
 
 impl ApplicationReads for Application {
+    fn status_with_targets(
+        &self,
+        operation_id: &str,
+    ) -> Result<(SetDeploymentImageStatus, kapsel::OperationTargets), ApplicationError> {
+        self.read_set_deployment_image_status_with_targets(operation_id)
+    }
+
     fn status(&self, operation_id: &str) -> Result<SetDeploymentImageStatus, ApplicationError> {
         self.read_set_deployment_image_status(operation_id)
     }
@@ -347,6 +362,7 @@ fn open_test_application(root: &std::path::Path) -> io::Result<Application> {
     let authorization_seed = [41_u8; 32];
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "process-auth".into(),
         operation_id: "process-op".into(),
         namespace: "demo".into(),
@@ -639,11 +655,11 @@ async fn dispatch_with_state<R: ApplicationReads + 'static, E: ApplicationExecut
                 reads
                     .lock()
                     .map_err(|_| ApplicationError::OperationFailure)?
-                    .status(&operation_id)
+                    .status_with_targets(&operation_id)
             })
             .await
             .unwrap_or(Err(ApplicationError::OperationFailure));
-            (render_status(&result), ResponseClass::Ordinary)
+            (render_status_with_targets(result), ResponseClass::Ordinary)
         },
         Request::Receipt { operation_id } if valid_identity(&operation_id) => {
             let reads = state.reads.clone();
@@ -742,6 +758,38 @@ fn render_status(result: &Result<SetDeploymentImageStatus, ApplicationError>) ->
     }
 }
 
+fn render_status_with_targets(
+    result: Result<(SetDeploymentImageStatus, kapsel::OperationTargets), ApplicationError>,
+) -> Vec<u8> {
+    let Ok((status, targets)) = result else {
+        return operation_failure();
+    };
+    let mut output = render_status(&Ok(status));
+    if status == SetDeploymentImageStatus::NotFound
+        || targets == kapsel::OperationTargets::default()
+    {
+        return output;
+    }
+    let exact = |target: Option<kapsel::ApprovedTarget>| {
+        target.map(|target| {
+        serde_json::json!({ "uid": target.uid, "resource_version": target.resource_version })
+    })
+    };
+    let fields = serde_json::json!({
+        "approved_target": exact(targets.approved_target),
+        "attempt_target": exact(targets.attempt_target),
+        "observed_target": targets.observed_target.map(|target| serde_json::json!({
+            "uid": target.uid, "resource_version": target.resource_version,
+        })),
+    })
+    .to_string();
+    // Both objects are locally rendered JSON. Join fields without parsing or changing values.
+    output.pop();
+    output.push(b',');
+    output.extend_from_slice(&fields.as_bytes()[1..]);
+    output
+}
+
 fn render_receipt(result: Result<SetDeploymentImageReceipt, ApplicationError>) -> Vec<u8> {
     match result {
         Ok(SetDeploymentImageReceipt::NotFound) => br#"{"status":"NOT_FOUND"}"#.to_vec(),
@@ -786,6 +834,7 @@ const fn target_rejection(rejection: TargetRejection) -> &'static str {
         TargetRejection::DeploymentNotFound => "DEPLOYMENT_NOT_FOUND",
         TargetRejection::ContainerNotFound => "CONTAINER_NOT_FOUND",
         TargetRejection::InvalidTarget => "INVALID_TARGET",
+        TargetRejection::StaleApproval => "STALE_APPROVAL",
     }
 }
 
@@ -2126,6 +2175,7 @@ mod linux_tests {
         let seed = [41_u8; 32];
         let key = SigningKey::from_bytes(&seed);
         let authorization = ExactAuthorization {
+            approved_target: None,
             authorization_id: "socket-auth-1".into(),
             operation_id: "socket-op-1".into(),
             namespace: "demo".into(),

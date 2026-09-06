@@ -107,6 +107,7 @@
     #[test]
     fn hostile_receipt_inputs_fail_closed_without_verified_vocabulary() {
         let statement = ReceiptStatement {
+            approved_target: None,
             operation_id: "op-001".into(),
             authorization_id: "auth-001".into(),
             authorization_signer_key_id: "effect-gateway-authorization-test-key".into(),

@@ -303,6 +303,11 @@ def main() -> None:
         current_environment["CARGO_TARGET_DIR"] = str(target / "current")
         historical_environment = base_environment.copy()
         historical_environment["CARGO_TARGET_DIR"] = str(target / "historical")
+        # The v0.1.1 adapter predates the receiver-observation outcome binding. The
+        # overlaid harness carries both observe forms; this cfg selects the historical one.
+        historical_environment["RUSTFLAGS"] = (
+            "--cfg=historical_v011 --check-cfg=cfg(historical_v011)"
+        )
 
         run(cargo_test_command(MATRIX_TEST, ignored=False), root, current_environment)
         require_sha256(harness, harness_sha256, "before historical Cargo invocation")

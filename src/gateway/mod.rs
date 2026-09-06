@@ -21,8 +21,9 @@ use authorization::VerifiedAuthorization;
 pub(crate) use authorization::{
     sign_authorization_grant, validate_authorization_trust, verify_authorization_grant,
 };
-pub use authorization::{AuthorizationTrust, ExactAuthorization};
+pub use authorization::{ApprovedTarget, AuthorizationTrust, ExactAuthorization};
 use journal::Journal;
+pub(crate) use kubernetes::KubernetesDeploymentImageAdapter;
 #[cfg(test)]
 pub(crate) use kubernetes::{
     deployment_patch_document_for_test as test_deployment_patch_document,
@@ -30,10 +31,7 @@ pub(crate) use kubernetes::{
     KubernetesDeploymentImageAdapter as TestKubernetesDeploymentImageAdapter,
     ReceiverObservation as TestReceiverObservation, TargetIdentity as TestTargetIdentity,
 };
-use kubernetes::{
-    ApplyOutcome, KubernetesDeploymentImageAdapter, ReceiverObservation, TargetIdentity,
-    ValidatedTargetIdentity,
-};
+use kubernetes::{ApplyOutcome, ReceiverObservation, TargetIdentity, ValidatedTargetIdentity};
 pub use receipt::{
     inspect_receipt, InspectionLimits, InspectionReport, InspectionStatus, ReceiptError,
     ReceiptStatement, ReceiptTrust,
@@ -159,6 +157,30 @@ impl AuthorizedRequest {
     }
 }
 
+/// Bounded receiver identity/version facts, with explicit missing observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedTarget {
+    /// Receiver UID, when observed.
+    pub uid: Option<String>,
+    /// Opaque receiver version, when observed.
+    pub resource_version: Option<String>,
+}
+
+/// Distinct approval, observation, and mutation-precondition projections.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "contract names distinguish approval from observations and attempts"
+)]
+pub struct OperationTargets {
+    /// Signed object version, absent for legacy authority.
+    pub approved_target: Option<ApprovedTarget>,
+    /// Frozen receiver observation or preflight read, never an inferred approval.
+    pub observed_target: Option<ObservedTarget>,
+    /// Frozen mutation preconditions, absent before apply_started.
+    pub attempt_target: Option<ApprovedTarget>,
+}
+
 /// Public durable states defined by the effect-gateway owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationState {
@@ -198,6 +220,8 @@ pub enum TargetRejection {
     ContainerNotFound,
     /// The target lacked a valid bounded UID or resource version.
     InvalidTarget,
+    /// The observed object identity or version differs from the signed approval.
+    StaleApproval,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -344,7 +368,7 @@ impl Gateway {
             }
             return Ok(SubmissionResult::Existing(existing));
         }
-        self.journal.insert_requested(authorized.request())?;
+        self.journal.insert_requested(&authorized)?;
         if fault == Some(FaultPoint::RequestedCommitted) {
             return Err(GatewayError::InjectedFault);
         }
@@ -693,7 +717,9 @@ impl Gateway {
                 }
                 let target = ValidatedTargetIdentity::try_from(target)
                     .map_err(|_| GatewayError::InvalidKubernetesFact)?;
-                self.journal.mark_apply_started(&operation, &target)?;
+                let Some(target) = self.journal.begin_attempt(&operation, target)? else {
+                    return Ok(Some(OperationState::NotAttempted));
+                };
                 if fault == Some(FaultPoint::ApplyStartedCommitted) {
                     return Err(GatewayError::InjectedFault);
                 }

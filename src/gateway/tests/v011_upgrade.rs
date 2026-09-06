@@ -29,6 +29,13 @@ const MIGRATION_SEAMS: &[&str] = &[
     "marker_set_inside_exclusive_transaction",
     "after_marker_commit",
 ];
+/// Nullable columns the format-3 journal appends to every recognized layout.
+const SNAPSHOT_COLUMN_NAMES: [&str; 4] = [
+    "approved_uid",
+    "approved_resource_version",
+    "preflight_uid",
+    "preflight_resource_version",
+];
 const RESTORE_SEAMS: &[&str] = &[
     "before_publication",
     "after_synchronized_quarantine",
@@ -159,6 +166,7 @@ impl Drop for MutationChild {
     }
 }
 
+#[allow(unexpected_cfgs)]
 #[allow(
     clippy::unused_async_trait_impl,
     reason = "the fixture adapter mirrors the production async provider seam"
@@ -184,6 +192,18 @@ impl DeploymentImageAdapter for SideEffectAdapter {
         std::future::pending::<Result<ApplyOutcome, ()>>().await
     }
 
+    // The v0.1.1 adapter seam predates the receiver-observation outcome binding. The
+    // historical upgrade build selects its two-parameter observe via `--cfg=historical_v011`
+    // supplied by scripts/test-v011-upgrade-fixtures.py.
+    #[cfg(historical_v011)]
+    async fn observe(
+        &mut self,
+        _: &SetDeploymentImageRequest,
+    ) -> Result<ReceiverObservation, ()> {
+        Err(())
+    }
+
+    #[cfg(not(historical_v011))]
     async fn observe(
         &mut self,
         _: &SetDeploymentImageRequest,
@@ -352,7 +372,7 @@ fn v011_marked_fixture_reopen() {
         );
         assert_decoded_operation_state(&gateway, case.state);
         drop(gateway);
-        assert_eq!(journal_version(&database), 2);
+        assert_eq!(journal_version(&database), 3);
         assert_eq!(durable_row(&database), row_before);
         assert_eq!(sha256_file(&database), digest_before);
     }
@@ -664,13 +684,16 @@ fn verify_fixture(output: &Path, case: &FixtureCase, harness_sha256: &str) {
     );
     assert_decoded_operation_state(&gateway, case.state);
     drop(gateway);
-    assert_eq!(journal_version(&database), 2);
-    assert_eq!(durable_row(&database), row_before);
+    assert_eq!(journal_version(&database), 3);
+    // The format-3 migration appends the four nullable snapshot columns null.
+    let mut migrated_row = row_before;
+    migrated_row.extend(std::iter::repeat_n(SqlValue::Null, SNAPSHOT_COLUMN_NAMES.len()));
+    assert_eq!(durable_row(&database), migrated_row);
     assert_ne!(sha256_file(&database), before_sha256);
     let marked_sha256 = sha256_file(&database);
     drop(Gateway::open_for_test(&database).unwrap());
     assert_eq!(sha256_file(&database), marked_sha256);
-    assert_eq!(durable_row(&database), row_before);
+    assert_eq!(durable_row(&database), migrated_row);
     assert_eq!(sha256_file(&backup), before_sha256);
     assert_eq!(
         fs::read_to_string(fixture.join("provider-call-count.txt")).unwrap(),
@@ -764,7 +787,7 @@ fn verify_process_loss_case(fixture: &Path, case: &FixtureCase) {
         assert_eq!(gateway.get(OPERATION_ID).unwrap(), Some(operation_state(case.state)));
         assert_decoded_operation_state(&gateway, case.state);
         drop(gateway);
-        assert_eq!(journal_version(&database), 2);
+        assert_eq!(journal_version(&database), 3);
         let after_first_reopen = sha256_file(&database);
         drop(Gateway::open_for_test(&database).unwrap());
         assert_eq!(sha256_file(&database), after_first_reopen);
@@ -789,7 +812,7 @@ fn verify_process_loss_case(fixture: &Path, case: &FixtureCase) {
         assert_eq!(gateway.get(OPERATION_ID).unwrap(), Some(operation_state(case.state)));
         assert_decoded_operation_state(&gateway, case.state);
         drop(gateway);
-        assert_eq!(journal_version(&database), 2);
+        assert_eq!(journal_version(&database), 3);
         let after_first_reopen = sha256_file(&database);
         drop(Gateway::open_for_test(&database).unwrap());
         assert_eq!(sha256_file(&database), after_first_reopen);
@@ -929,7 +952,7 @@ fn wait_for_child_exit(
 }
 
 fn assert_hot_rollback_before_kill(database: &Path) {
-    assert_eq!(raw_header_version(database), 2);
+    assert_eq!(raw_header_version(database), 3);
     let journal = rollback_journal_path(database);
     assert_private_file(&journal);
     let bytes = fs::read(&journal).unwrap();
@@ -1008,9 +1031,55 @@ fn assert_fixture_snapshot(fixture: &Path, case: &FixtureCase, expected: &Fixtur
     let database = fixture.join("journal.sqlite3");
     let backup = upgrade_backup_path(&database);
     let digest = upgrade_digest_path(&database);
-    assert_eq!(durable_row(&database), expected.row);
-    assert_eq!(database_schema(&database), expected.schema);
-    assert_eq!(database_columns(&database), expected.columns);
+    // Format 3 appends the four nullable snapshot columns to the v0.1.1 layout
+    // without altering any historical fact. Only a migrated journal carries them;
+    // the final comparison runs against the raw v0.1.1 backup before migration.
+    let migrated = journal_version(&database) == 3;
+    let mut expected_row = expected.row.clone();
+    if migrated {
+        expected_row.extend(
+            std::iter::repeat_n(SqlValue::Null, SNAPSHOT_COLUMN_NAMES.len()),
+        );
+    }
+    assert_eq!(durable_row(&database), expected_row);
+    // SQLite rewrites the stored CREATE statement during ALTER TABLE ADD COLUMN,
+    // appending the four snapshot column definitions before the closing paren.
+    let schema_addition = "\n                , approved_uid TEXT, approved_resource_version TEXT, \
+         preflight_uid TEXT, preflight_resource_version TEXT";
+    let schema_tail = "\n                ) STRICT";
+    let expected_schema: Vec<FixtureSchemaEntry> = expected
+        .schema
+        .iter()
+        .map(|(kind, name, table, sql)| {
+            let sql = sql.as_ref().map(|sql| {
+                if name != "kubernetes_image_operations" || !migrated {
+                    return sql.clone();
+                }
+                sql.strip_suffix(schema_tail)
+                    .map_or_else(|| sql.clone(), |head| {
+                        format!("{head}{schema_addition}) STRICT")
+                    })
+            });
+            (kind.clone(), name.clone(), table.clone(), sql)
+        })
+        .collect();
+    assert_eq!(database_schema(&database), expected_schema);
+    let mut expected_columns = expected.columns.clone();
+    if migrated {
+        let first_snapshot_cid = i64::try_from(expected_columns.len()).unwrap();
+        for (index, name) in SNAPSHOT_COLUMN_NAMES.iter().enumerate() {
+            expected_columns.push((
+                first_snapshot_cid + i64::try_from(index).unwrap(),
+                (*name).into(),
+                "TEXT".into(),
+                0,
+                None,
+                0,
+                0,
+            ));
+        }
+    }
+    assert_eq!(database_columns(&database), expected_columns);
     assert_eq!(
         fs::read_to_string(fixture.join("provider-call-count.txt")).unwrap(),
         expected.provider_call_count

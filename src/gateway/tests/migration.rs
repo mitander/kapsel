@@ -50,7 +50,7 @@
     fn fresh_journal_initializes_directly_and_reopens_without_another_write() {
         let path = database_path("fresh-version-marker");
         drop(Gateway::open_for_test(&path).unwrap());
-        assert_eq!(journal_version(&path), 2);
+        assert_eq!(journal_version(&path), 3);
         assert!(!PathBuf::from(format!("{}.kapsel-v011.backup", path.display())).exists());
 
         let before = fs::read(&path).unwrap();
@@ -165,6 +165,21 @@
             .submit_exact_for_test(&request, &authorization(&request))
             .unwrap();
         drop(gateway);
+        let connection = Connection::open(&path).unwrap();
+        for column in [
+            "approved_uid",
+            "approved_resource_version",
+            "preflight_uid",
+            "preflight_resource_version",
+        ] {
+            connection
+                .execute(
+                    &format!("ALTER TABLE kubernetes_image_operations DROP COLUMN {column}"),
+                    [],
+                )
+                .unwrap();
+        }
+        drop(connection);
         set_journal_version(&path, 0);
         let row_before: Vec<String> = Connection::open(&path)
             .unwrap()
@@ -179,7 +194,7 @@
         write_upgrade_backup(&path);
 
         drop(Gateway::open_for_test(&path).unwrap());
-        assert_eq!(journal_version(&path), 2);
+        assert_eq!(journal_version(&path), 3);
         let row_after: Vec<String> = Connection::open(&path)
             .unwrap()
             .query_row(
@@ -227,7 +242,7 @@
 
     #[test]
     fn unknown_or_newer_marker_refuses_without_touching_the_store() {
-        for version in [1, 3] {
+        for version in [1, 4] {
             let path = database_path(&format!("unsupported-version-marker-{version}"));
             drop(Gateway::open_for_test(&path).unwrap());
             set_journal_version(&path, version);

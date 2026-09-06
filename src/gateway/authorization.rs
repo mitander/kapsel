@@ -8,7 +8,7 @@ use kapsel_authority::{
     self as authority, AuthorizationGrantError, AuthorizationInputField,
     ValidatedAuthorizationGrant,
 };
-pub use kapsel_authority::{AuthorizationTrust, ExactAuthorization};
+pub use kapsel_authority::{ApprovedTarget, AuthorizationTrust, ExactAuthorization};
 
 use super::GatewayError;
 

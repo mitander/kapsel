@@ -322,6 +322,7 @@ fn installation_root_with_url(name: &str, kubernetes_url: &str) -> PathBuf {
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
     let grant = provision_exact_grant(&GrantProvisioning {
         authorization: &ExactAuthorization {
+            approved_target: None,
             authorization_id: "service-auth".into(),
             operation_id: "process-op".into(),
             namespace: "demo".into(),

@@ -749,6 +749,7 @@ mod tests {
     #[test]
     fn fixed_authority_and_deployment_target_are_exact() {
         let mut authorization = kapsel_authority::ExactAuthorization {
+            approved_target: None,
             authorization_id: String::from("authorization-1"),
             operation_id: String::from("operation-1"),
             namespace: String::from("demo"),

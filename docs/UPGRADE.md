@@ -342,3 +342,13 @@ filesystem that violates SQLite, atomic-rename, `fsync`, or directory-sync guara
 hardware that acknowledges but loses synchronized writes; torn sectors; controller caches without
 power-loss protection; a live copy; a moved receipt directory; a downloaded artifact; another
 release pair; or restoration after lifecycle advancement.
+
+## Unpublished snapshot journal
+
+HEAD upgrades recognized format 2 journals transactionally to format 3, adding nullable approval and
+preflight observation facts. Legacy rows and frozen receipts retain their original meanings and
+bytes. Older binaries reject format 3. Format 0 still follows the backup prerequisite above. This is
+not a new published v0.2.x upgrade promise. The
+[effect-gateway owner](EFFECT_GATEWAY.md#exact-snapshot-approval-in-unpublished-head) defines exact
+authority binding, legacy entry paths and receipt compatibility. The resident service requires a
+snapshot grant and will not resume a legacy handle by replacing its authority.

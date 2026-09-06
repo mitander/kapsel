@@ -64,6 +64,70 @@ trust from the request or grant.
 The release-owned experiment uses a local `kind` cluster. It does not require a cloud account,
 hosted Kapsel service, or production credentials.
 
+## Exact-snapshot approval in unpublished HEAD
+
+An approval for one object version must not become authority over a later object. Grant v2 binds
+`approved_target`, the Deployment UID and opaque resourceVersion independently acquired by the
+operator, in addition to the exact v1 authorization tuple. Each value is 1–128 ASCII bytes. Equality
+is byte-for-byte, with no numeric interpretation, normalization, or refresh. Kubernetes assigns
+[UIDs](https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids) to distinguish
+recreated objects. Its
+[conditional updates](https://v1-33.docs.kubernetes.io/docs/reference/using-api/api-concepts/#patch-and-apply)
+use resourceVersion to reject intervening writes.
+
+Grant v2 uses `KAPSEL-KAP0038-K8S-GRANT-STATEMENT-V2\0` and `KAPSEL-KAP0038-K8S-GRANT-V2\0`, with
+purpose `kapsel.kap0038.kubernetes-set-deployment-image-grant.v2`. Statement fields 1–6 retain their
+v1 order. Fields 7 and 8 are approved UID and resourceVersion. Envelope order and signature
+construction are unchanged. The 2 KiB statement, 4 KiB grant, 512-byte individual text, strict
+record ordering, and existing identity/trust bounds remain. Mixed envelope/statement versions fail
+closed.
+
+The resident service requires v2, including startup and restart. Legacy CLI/MCP paths still accept
+v1 with its original late-bound meaning. Every path accepting v2 enforces the snapshot. Neither
+existing grant bytes nor existing operation handles can acquire snapshot authority. Reapproval needs
+an operator-created grant and a new handle. It is not an automatic retry after `UNKNOWN`.
+
+`kapsel provision-snapshot-grant` uses the existing operator authorization JSON (no UID or version
+fields), signing seed, key ID and output arguments, plus an explicit private `--kubeconfig`. It
+validates the tuple, reads the named Deployment through the bounded production adapter, validates
+the named container, and signs the independently read UID/version. It accepts no caller-supplied
+snapshot bytes. The operator owns the proposal file, credentials, invocation and output. Acquisition
+has the existing ten-second deadline and 2 MiB response cap. No snapshot document format or second
+authority store is introduced.
+
+Before `apply_started`, a successful target read supplies `observed_target`, distinct from approval.
+Mismatch durably freezes `NOT_ATTEMPTED / STALE_APPROVAL`, including that observed target, without
+attempt, receiver result, effect receipt, or signed denial artifact. Other permanent read rejections
+retain their meanings and have no observed target. A matching read freezes `attempt_target` using
+the approved values, never substituted fresh values. The actual strategic merge PATCH includes both
+approved UID and resourceVersion. An intervening conflict after the marker is still an attempted
+path, never `NOT_ATTEMPTED`. The marker does not establish network transmission. Recovery after it
+only observes and never resends.
+
+Journal format 3 adds nullable approved UID/version and preflight observed UID/version columns to
+recognized format 2 layouts in one exclusive transaction. Legacy rows retain null approval and their
+original frozen receipts. Format 0 upgrade still requires the exact offline backup. Older binaries
+reject format 3. New requests bind original grant identity, signer and digest at their first durable
+insertion, including the requested window. Preexisting unbound requested rows may resume only with
+legacy authority. Snapshot authority never replaces authority on an existing row.
+
+`approved_target` is the signed approval or null for legacy authority. `attempt_target` is the
+frozen PATCH precondition pair or null before the marker. `observed_target` is the successful
+preflight read before the marker, and the frozen receiver UID/version once receiver observation is
+complete (either member may be absent). These projections disclose bounded public identity/version
+facts, not grant bytes, trust, credentials or paths. No observation is invented for a rejection
+without a successful read. Status is read-only and projects these facts alongside the disposition.
+
+Snapshot attempts emit receipt/statement v3 with magic prefixes ending `RECEIPT-V3\0` and
+`STATEMENT-V3\0`, and purpose `kapsel.kap0038.kubernetes-effect-receipt.v3`. Fields 1–27 retain
+their v2 meaning. Fields 28–29 contain approved UID/version. Fields 10–11 are `attempt_target`,
+which must exactly equal approval. Fields 12 and 18 are `observed_target`, not approval. Receipt and
+statement bounds do not change. Trust v2 remains the trust encoding but must explicitly appoint the
+v3 purpose for snapshot receipts. Old receipt v2 remains inspectable under its original purpose,
+with null approval, never invented snapshot evidence. Legacy actions still emit v2. Frozen bytes are
+never re-signed or upgraded. The sections below describe the unchanged legacy v1 grant/v2 receipt
+wire where not explicitly extended here. None of this adds a published v0.2.0 promise.
+
 ## Operation lifecycle
 
 The experiment journal has explicit local states:

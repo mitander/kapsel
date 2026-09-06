@@ -475,6 +475,7 @@ async fn run_gateway_proof(client: Client) -> Result<(), Box<dyn std::error::Err
     wait_for_deployment_rollout(&deployments, DEPLOYMENT).await?;
     let request = request();
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "kind-auth-001".into(),
         operation_id: request.operation_id.clone(),
         namespace: request.namespace.clone(),
@@ -553,6 +554,7 @@ async fn run_unknown_rollout_proof(client: Client) -> Result<(), Box<dyn std::er
     wait_for_deployment_rollout(&deployments, UNKNOWN_DEPLOYMENT).await?;
     let request = unknown_request();
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "kind-unknown-auth-001".into(),
         operation_id: request.operation_id.clone(),
         namespace: request.namespace.clone(),
@@ -656,6 +658,7 @@ async fn run_failed_rollout_proof(client: Client) -> Result<(), Box<dyn std::err
     wait_for_deployment_rollout(&deployments, FAILED_DEPLOYMENT).await?;
     let request = failed_request();
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "kind-failed-auth-001".into(),
         operation_id: request.operation_id.clone(),
         namespace: request.namespace.clone(),

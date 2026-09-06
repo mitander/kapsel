@@ -148,6 +148,7 @@ fn fixture() -> Fixture {
     let authorization_seed = [9_u8; 32];
     let authorization_key = SigningKey::from_bytes(&authorization_seed);
     let authorization = ExactAuthorization {
+        approved_target: None,
         authorization_id: "demo-auth-1".into(),
         operation_id: "demo-op-1".into(),
         namespace: "demo".into(),
