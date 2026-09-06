@@ -13,7 +13,7 @@ cluster_owned=0
 webhook_image_owned=0
 
 phase() {
-  printf '[kind %s/9] %s\n' "$1" "$2"
+  printf '[kind %s/10] %s\n' "$1" "$2"
 }
 
 monotonic_ns() {
@@ -37,7 +37,7 @@ cleanup() {
     fi
   fi
   if [[ $cluster_owned -eq 1 ]]; then
-    phase 9 "deleting owned cluster $cluster_name"
+    phase 10 "deleting owned cluster $cluster_name"
     cleanup_started=$(monotonic_ns)
     if ! kind delete cluster --name "$cluster_name"; then
       printf 'could not delete owned kind cluster: %s\n' "$cluster_name" >&2
@@ -107,6 +107,14 @@ if docker image inspect "$webhook_image" >/dev/null 2>&1; then
   printf 'refusing to replace existing Docker image tag: %s\n' "$webhook_image" >&2
   exit 1
 fi
+if [[ -n $(git ls-files --others --exclude-standard) ]]; then
+  printf 'untracked files prevent an exact source-patch digest\n' >&2
+  exit 1
+fi
+source_revision=$(git rev-parse HEAD)
+source_patch_sha256=$(git diff --binary HEAD | shasum -a 256 | awk '{print $1}')
+printf '[kind evidence] base_revision=%s worktree_patch_sha256=%s\n' \
+  "$source_revision" "$source_patch_sha256"
 phase 1 "precompiling Kapsel tests"
 cargo test --locked -p kapsel --no-run
 phase 2 "creating disposable cluster $cluster_name"
@@ -264,4 +272,17 @@ KAPSEL_KIND_TEST=1 cargo test --locked \
   --nocapture
 scenario_finished=$(monotonic_ns)
 printf '[kind timing] recovery_policy_ms=%s\n' \
+  "$(elapsed_ms "$scenario_started" "$scenario_finished")"
+
+phase 9 "running exact-snapshot approval and precondition-race proof"
+scenario_started=$(monotonic_ns)
+KAPSEL_KIND_TEST=1 cargo test --locked \
+  -p kapsel \
+  kind_tests::kind_snapshot_approval_rejects_stale_targets_and_pins_the_conditional_patch \
+  -- \
+  --ignored \
+  --exact \
+  --nocapture
+scenario_finished=$(monotonic_ns)
+printf '[kind timing] snapshot_approval_ms=%s\n' \
   "$(elapsed_ms "$scenario_started" "$scenario_finished")"

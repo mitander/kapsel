@@ -78,6 +78,9 @@
         apply_calls: usize,
         observe_calls: usize,
         apply_started_seen: bool,
+        identified_target: TargetIdentity,
+        apply_failure: bool,
+        applied_target: Option<TargetIdentity>,
         outcome: ApplyOutcome,
         observation: ReceiverObservation,
     }
@@ -89,6 +92,12 @@
             apply_calls: 0,
             observe_calls: 0,
             apply_started_seen: false,
+            identified_target: TargetIdentity {
+                deployment_uid: "deployment-uid-1".into(),
+                resource_version: "resource-version-0".into(),
+            },
+            apply_failure: false,
+            applied_target: None,
             outcome: ApplyOutcome {
                 accepted: true,
                 requested_generation: Some(2),
@@ -115,18 +124,16 @@
             _: &SetDeploymentImageRequest,
         ) -> Result<TargetIdentity, TargetReadError> {
             self.identify_calls += 1;
-            Ok(TargetIdentity {
-                deployment_uid: "deployment-uid-1".into(),
-                resource_version: "resource-version-0".into(),
-            })
+            Ok(self.identified_target.clone())
         }
 
         async fn apply(
             &mut self,
             request: &SetDeploymentImageRequest,
-            _: &TargetIdentity,
+            target: &TargetIdentity,
         ) -> Result<ApplyOutcome, ()> {
             self.apply_calls += 1;
+            self.applied_target = Some(target.clone());
             let connection = Connection::open(&self.database_path).map_err(|_| ())?;
             let persisted: (String, i64, String) = connection
                 .query_row(
@@ -139,6 +146,9 @@
                 .map_err(|_| ())?;
             self.apply_started_seen =
                 persisted == ("apply_started".into(), 1, WRITE_STRATEGY.into());
+            if self.apply_failure {
+                return Err(());
+            }
             Ok(self.outcome.clone())
         }
 

@@ -103,6 +103,12 @@ must clean up or export bounded failure evidence. Its recovery-policy case uses 
 mutating webhook to separate PATCH requests and admission effects from persisted Deployment and
 controller effects when an identical stale patch is replayed.
 
+The exact-snapshot case separately acquires the operator target through the production adapter. It
+proves one matching PATCH, preflight stale rejection for both version drift and same-name recreation
+without a PATCH, and a changed receiver version between preflight and the gateway PATCH. That final
+conflict remains `apply_started`, not a pre-attempt conclusion; deterministic fault tests own the
+exhaustive restart and receipt-projection matrix around it.
+
 The public demonstration adds an observable evaluator path through healthy,
 `ProgressDeadlineExceeded`, mutation-loss, and receipt-publication-loss cases. Compile-time harness
 controls remain outside caller input and the ordinary executable. A visual demonstration is finite

@@ -229,7 +229,11 @@ With Docker, kind 0.32+, kubectl 1.30+, and OpenSSL:
 The script owns creation, failure-log export, and cleanup of its uniquely named cluster. It also
 installs an instrumented mutating webhook and proves on the pinned Kubernetes v1.33.12 receiver that
 an identical stale patch reaches admission again without a second Deployment or controller effect.
-This lane is separate from deterministic CI.
+Its exact-snapshot case acquires the operator-owned target, proves one matching conditional patch,
+then proves version drift and same-name recreation stop before a PATCH while a preflight-to-PATCH
+race reaches the marked conditional-request path. Its output records the base revision and exact
+working-tree patch digest, commands, timings, prerequisites, and cleanup; it refuses untracked files
+that cannot be represented by that digest. This lane is separate from deterministic CI.
 
 ## Public crash-recovery demonstration
 

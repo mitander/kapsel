@@ -50,6 +50,131 @@ async fn stale_snapshot_is_durable_status_only_without_patch_or_receipt() {
 }
 
 #[tokio::test]
+async fn matching_snapshot_freezes_distinct_approved_observed_and_attempt_targets() {
+    let path = database_path("matching-snapshot-targets");
+    let request = request();
+    let approval = snapshot_authorization(&request);
+    let mut gateway = Gateway::open_for_test(&path).unwrap();
+    gateway.submit_exact_for_test(&request, &approval).unwrap();
+    let mut adapter = failed_adapter(&path, &request);
+
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut adapter, None).await.unwrap(),
+        Some(OperationState::ReceiverObserved)
+    );
+    assert_eq!(adapter.apply_calls, 1);
+    assert_eq!(
+        adapter
+            .applied_target
+            .as_ref()
+            .map(|target| (&target.deployment_uid, &target.resource_version)),
+        approval
+            .approved_target
+            .as_ref()
+            .map(|target| (&target.uid, &target.resource_version))
+    );
+    let row = gateway.journal.operation(&request.operation_id).unwrap().unwrap();
+    let targets = row.targets();
+    assert_eq!(targets.approved_target, approval.approved_target);
+    assert_eq!(targets.attempt_target, approval.approved_target);
+    assert_eq!(
+        targets.observed_target,
+        Some(ObservedTarget {
+            uid: Some("deployment-uid-1".into()),
+            resource_version: Some("resource-version-2".into()),
+        })
+    );
+    let statement = gateway.journal.receipt_statement(&request.operation_id).unwrap().unwrap();
+    assert_eq!(statement.approved_target(), approval.approved_target.as_ref());
+    assert_eq!(statement.target_uid(), "deployment-uid-1");
+    assert_eq!(statement.target_resource_version(), "resource-version-0");
+    assert_eq!(statement.receiver_uid(), Some("deployment-uid-1"));
+    assert_eq!(statement.observed_resource_version(), Some("resource-version-2"));
+}
+
+#[tokio::test]
+async fn snapshot_apply_failure_after_marker_is_attempted_and_recovery_only_observes() {
+    let path = database_path("snapshot-patch-conflict");
+    let request = request();
+    let approval = snapshot_authorization(&request);
+    let mut gateway = Gateway::open_for_test(&path).unwrap();
+    gateway.submit_exact_for_test(&request, &approval).unwrap();
+    let mut conflict = failed_adapter(&path, &request);
+    conflict.apply_failure = true;
+
+    assert!(matches!(
+        gateway.run_once_with_adapter(&mut conflict, None).await,
+        Err(GatewayError::KubernetesApply)
+    ));
+    assert_eq!(gateway.get(&request.operation_id).unwrap(), Some(OperationState::ApplyStarted));
+    assert_eq!(conflict.apply_calls, 1);
+    assert_eq!(
+        conflict
+            .applied_target
+            .as_ref()
+            .map(|target| (&target.deployment_uid, &target.resource_version)),
+        approval
+            .approved_target
+            .as_ref()
+            .map(|target| (&target.uid, &target.resource_version))
+    );
+    let row = gateway.journal.operation(&request.operation_id).unwrap().unwrap();
+    assert_eq!(row.targets().approved_target, approval.approved_target);
+    assert_eq!(row.targets().attempt_target, approval.approved_target);
+    assert_eq!(
+        row.targets().observed_target,
+        Some(ObservedTarget {
+            uid: Some("deployment-uid-1".into()),
+            resource_version: Some("resource-version-0".into()),
+        })
+    );
+    assert!(row.result().is_none());
+    drop(gateway);
+
+    let mut gateway = Gateway::open_for_test(&path).unwrap();
+    let mut recovery = failed_adapter(&path, &request);
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut recovery, None).await.unwrap(),
+        Some(OperationState::ReceiverObserved)
+    );
+    assert_eq!((recovery.identify_calls, recovery.apply_calls, recovery.observe_calls), (0, 0, 1));
+    drop(gateway);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn restart_before_attempt_revalidates_the_original_snapshot_without_refreshing_it() {
+    let path = database_path("snapshot-restart-before-attempt");
+    let request = request();
+    let approval = snapshot_authorization(&request);
+    let gateway = Gateway::open_for_test(&path).unwrap();
+    assert!(matches!(
+        gateway.submit_exact_with_fault_for_test(
+            &request,
+            &approval,
+            Some(FaultPoint::AuthorizedCommitted)
+        ),
+        Err(GatewayError::InjectedFault)
+    ));
+    drop(gateway);
+
+    let mut gateway = Gateway::open_for_test(&path).unwrap();
+    let mut adapter = failed_adapter(&path, &request);
+    adapter.identified_target.resource_version = "intervening-write".into();
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut adapter, None).await.unwrap(),
+        Some(OperationState::NotAttempted)
+    );
+    assert_eq!((adapter.identify_calls, adapter.apply_calls, adapter.observe_calls), (1, 0, 0));
+    let row = gateway.journal.operation(&request.operation_id).unwrap().unwrap();
+    assert_eq!(row.target_rejection(), Some(TargetRejection::StaleApproval));
+    assert_eq!(row.targets().approved_target, approval.approved_target);
+    assert!(row.targets().attempt_target.is_none());
+    drop(gateway);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_restart_retains_authority_and_marker_recovery_never_resends() {
     for seam in [
         FaultPoint::RequestedCommitted,

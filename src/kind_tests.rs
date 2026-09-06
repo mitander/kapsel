@@ -14,10 +14,11 @@ use kube::{
     api::{Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams},
     Client,
 };
+use serde_json::json;
 
 use crate::{
-    inspect_receipt, test_deployment_patch_document, DeploymentImageAdapter, ExactAuthorization,
-    FaultPoint, Gateway, GatewayError, InspectionLimits, InspectionStatus,
+    inspect_receipt, test_deployment_patch_document, ApprovedTarget, DeploymentImageAdapter,
+    ExactAuthorization, FaultPoint, Gateway, GatewayError, InspectionLimits, InspectionStatus,
     KubernetesDeploymentImageAdapter, OperationResult, OperationState, ReceiptSettings,
     ReceiptTrust, SetDeploymentImageRequest, TargetIdentity,
 };
@@ -26,6 +27,7 @@ const NAMESPACE: &str = "kapsel-effect-gateway";
 const FAILED_NAMESPACE: &str = "kapsel-effect-gateway-failed";
 const UNKNOWN_NAMESPACE: &str = "kapsel-effect-gateway-unknown";
 const POLICY_NAMESPACE: &str = "kapsel-recovery-policy";
+const SNAPSHOT_NAMESPACE: &str = "kapsel-effect-gateway-snapshot";
 const DEPLOYMENT: &str = "image-demo";
 const FAILED_DEPLOYMENT: &str = "image-demo-failed";
 const UNKNOWN_DEPLOYMENT: &str = "image-demo-unknown";
@@ -68,6 +70,62 @@ impl DeploymentImageAdapter for CountingAdapter {
         target: &crate::TargetIdentity,
     ) -> Result<crate::ApplyOutcome, ()> {
         self.apply_calls += 1;
+        self.inner.apply(request, target).await
+    }
+
+    async fn observe(
+        &mut self,
+        request: &SetDeploymentImageRequest,
+        outcome: &crate::ApplyOutcome,
+    ) -> Result<crate::ReceiverObservation, ()> {
+        self.inner.observe(request, outcome).await
+    }
+}
+
+struct PreconditionRaceAdapter {
+    client: Client,
+    inner: KubernetesDeploymentImageAdapter,
+    apply_calls: usize,
+}
+
+impl PreconditionRaceAdapter {
+    fn new(client: Client) -> Self {
+        Self {
+            inner: KubernetesDeploymentImageAdapter::new(client.clone()),
+            client,
+            apply_calls: 0,
+        }
+    }
+}
+
+impl DeploymentImageAdapter for PreconditionRaceAdapter {
+    async fn identify(
+        &mut self,
+        request: &SetDeploymentImageRequest,
+    ) -> Result<crate::TargetIdentity, crate::TargetReadError> {
+        self.inner.identify(request).await
+    }
+
+    async fn apply(
+        &mut self,
+        request: &SetDeploymentImageRequest,
+        target: &crate::TargetIdentity,
+    ) -> Result<crate::ApplyOutcome, ()> {
+        self.apply_calls += 1;
+        Api::<Deployment>::namespaced(self.client.clone(), &request.namespace)
+            .patch(
+                &request.deployment,
+                &PatchParams::default(),
+                &Patch::Merge(json!({
+                    "metadata": {
+                        "annotations": {
+                            "kapsel.dev/kind-snapshot-race": request.operation_id,
+                        },
+                    },
+                })),
+            )
+            .await
+            .map_err(|_| ())?;
         self.inner.apply(request, target).await
     }
 
@@ -261,6 +319,245 @@ async fn kind_stale_exact_replay_reaches_admission_without_a_second_persisted_ch
     );
     assert!(cleanup.is_ok(), "kind recovery-policy cleanup failed");
     proof.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/test-kind-effect-gateway.sh"]
+async fn kind_snapshot_approval_rejects_stale_targets_and_pins_the_conditional_patch() {
+    assert_eq!(std::env::var("KAPSEL_KIND_TEST").as_deref(), Ok("1"));
+    let client = Client::try_default().await.unwrap();
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        namespaces.create(
+            &PostParams::default(),
+            &Namespace {
+                metadata: ObjectMeta {
+                    name: Some(SNAPSHOT_NAMESPACE.into()),
+                    ..ObjectMeta::default()
+                },
+                ..Namespace::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let proof = tokio::time::timeout(
+        std::time::Duration::from_mins(1),
+        run_snapshot_approval_proof(client.clone()),
+    )
+    .await
+    .map_or_else(
+        |_| Err("kind snapshot-approval proof exceeded 60 seconds".into()),
+        |result| result.map_err(|error| error.to_string()),
+    );
+    let cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        namespaces.delete(SNAPSHOT_NAMESPACE, &DeleteParams::default()),
+    )
+    .await
+    .map_or_else(
+        |_| Err("kind snapshot-approval cleanup exceeded 15 seconds".into()),
+        |result| result.map(|_| ()).map_err(|error| error.to_string()),
+    );
+    assert!(cleanup.is_ok(), "kind snapshot-approval cleanup failed");
+    proof.unwrap();
+}
+
+async fn run_snapshot_approval_proof(client: Client) -> Result<(), Box<dyn std::error::Error>> {
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), SNAPSHOT_NAMESPACE);
+
+    prove_matching_snapshot_patches_once(&client, &deployments).await?;
+    prove_drifted_snapshot_rejects_before_patch(&client, &deployments).await?;
+    prove_recreated_snapshot_rejects_before_patch(&client, &deployments).await?;
+    prove_precondition_race_remains_attempted(&client, &deployments).await?;
+    Ok(())
+}
+
+async fn prove_matching_snapshot_patches_once(
+    client: &Client,
+    deployments: &Api<Deployment>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = snapshot_request("kind-snapshot-match-001", "snapshot-match");
+    create_snapshot_fixture(deployments, &request.deployment).await?;
+    let approval = snapshot_authorization(client, &request).await?;
+    let directory = private_test_directory_for("snapshot-match");
+    let database = directory.join("journal.sqlite3");
+    let mut gateway = Gateway::open_for_test(&database)?;
+    gateway.submit_exact_for_test(&request, &approval)?;
+    let mut adapter = CountingAdapter::new(client.clone());
+
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut adapter, None).await?,
+        Some(OperationState::ReceiverObserved)
+    );
+    assert_eq!(adapter.apply_calls, 1);
+    assert_eq!(
+        gateway.result(&request.operation_id)?,
+        Some(OperationResult::Succeeded)
+    );
+    drop(gateway);
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+async fn prove_drifted_snapshot_rejects_before_patch(
+    client: &Client,
+    deployments: &Api<Deployment>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = snapshot_request("kind-snapshot-drift-001", "snapshot-drift");
+    create_snapshot_fixture(deployments, &request.deployment).await?;
+    let approval = snapshot_authorization(client, &request).await?;
+    advance_deployment_version(deployments, &request.deployment, "drift").await?;
+    let directory = private_test_directory_for("snapshot-drift");
+    let database = directory.join("journal.sqlite3");
+    let mut gateway = Gateway::open_for_test(&database)?;
+    gateway.submit_exact_for_test(&request, &approval)?;
+    let mut adapter = CountingAdapter::new(client.clone());
+
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut adapter, None).await?,
+        Some(OperationState::NotAttempted)
+    );
+    assert_eq!(adapter.apply_calls, 0);
+    assert_eq!(gateway.result(&request.operation_id)?, None);
+    drop(gateway);
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+async fn prove_recreated_snapshot_rejects_before_patch(
+    client: &Client,
+    deployments: &Api<Deployment>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = snapshot_request("kind-snapshot-recreated-001", "snapshot-recreated");
+    create_snapshot_fixture(deployments, &request.deployment).await?;
+    let approval = snapshot_authorization(client, &request).await?;
+    deployments
+        .delete(&request.deployment, &DeleteParams::default())
+        .await?;
+    wait_for_deployment_deletion(deployments, &request.deployment).await?;
+    create_snapshot_fixture(deployments, &request.deployment).await?;
+    let directory = private_test_directory_for("snapshot-recreated");
+    let database = directory.join("journal.sqlite3");
+    let mut gateway = Gateway::open_for_test(&database)?;
+    gateway.submit_exact_for_test(&request, &approval)?;
+    let mut adapter = CountingAdapter::new(client.clone());
+
+    assert_eq!(
+        gateway.run_once_with_adapter(&mut adapter, None).await?,
+        Some(OperationState::NotAttempted)
+    );
+    assert_eq!(adapter.apply_calls, 0);
+    assert_eq!(gateway.result(&request.operation_id)?, None);
+    drop(gateway);
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+async fn prove_precondition_race_remains_attempted(
+    client: &Client,
+    deployments: &Api<Deployment>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = snapshot_request("kind-snapshot-race-001", "snapshot-race");
+    create_snapshot_fixture(deployments, &request.deployment).await?;
+    let approval = snapshot_authorization(client, &request).await?;
+    let directory = private_test_directory_for("snapshot-race");
+    let database = directory.join("journal.sqlite3");
+    let mut gateway = Gateway::open_for_test(&database)?;
+    gateway.submit_exact_for_test(&request, &approval)?;
+    let mut adapter = PreconditionRaceAdapter::new(client.clone());
+
+    assert!(matches!(
+        gateway.run_once_with_adapter(&mut adapter, None).await,
+        Err(GatewayError::KubernetesApply)
+    ));
+    assert_eq!(adapter.apply_calls, 1);
+    assert_eq!(
+        gateway.get(&request.operation_id)?,
+        Some(OperationState::ApplyStarted)
+    );
+    assert_eq!(gateway.result(&request.operation_id)?, None);
+    drop(gateway);
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+async fn create_snapshot_fixture(
+    deployments: &Api<Deployment>,
+    deployment: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        deployments.create(
+            &PostParams::default(),
+            &fixture_deployment_for(SNAPSHOT_NAMESPACE, deployment),
+        ),
+    )
+    .await??;
+    wait_for_deployment_rollout(deployments, deployment).await
+}
+
+async fn snapshot_authorization(
+    client: &Client,
+    request: &SetDeploymentImageRequest,
+) -> Result<ExactAuthorization, Box<dyn std::error::Error>> {
+    let mut adapter = KubernetesDeploymentImageAdapter::new(client.clone());
+    let target = adapter
+        .identify(request)
+        .await
+        .map_err(|error| format!("could not acquire operator snapshot: {error:?}"))?;
+    Ok(ExactAuthorization {
+        approved_target: Some(ApprovedTarget {
+            uid: target.deployment_uid,
+            resource_version: target.resource_version,
+        }),
+        authorization_id: format!("{}-auth", request.operation_id),
+        operation_id: request.operation_id.clone(),
+        namespace: request.namespace.clone(),
+        deployment: request.deployment.clone(),
+        container: request.container.clone(),
+        immutable_image_digest: request.immutable_image_digest.clone(),
+    })
+}
+
+async fn advance_deployment_version(
+    deployments: &Api<Deployment>,
+    deployment: &str,
+    annotation: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    deployments
+        .patch(
+            deployment,
+            &PatchParams::default(),
+            &Patch::Merge(json!({
+                "metadata": {
+                    "annotations": {
+                        "kapsel.dev/kind-snapshot-test": annotation,
+                    },
+                },
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn wait_for_deployment_deletion(
+    deployments: &Api<Deployment>,
+    deployment: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if deployments.get_opt(deployment).await?.is_none() {
+                return Ok::<(), kube::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| "deleted snapshot Deployment remained observable for 10 seconds")??;
+    Ok(())
 }
 
 async fn run_recovery_policy_proof(client: Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -791,6 +1088,16 @@ fn policy_request() -> SetDeploymentImageRequest {
         operation_id: "kind-policy-op-001".into(),
         namespace: POLICY_NAMESPACE.into(),
         deployment: POLICY_DEPLOYMENT.into(),
+        container: "target".into(),
+        immutable_image_digest: TARGET_IMAGE.into(),
+    }
+}
+
+fn snapshot_request(operation_id: &str, deployment: &str) -> SetDeploymentImageRequest {
+    SetDeploymentImageRequest {
+        operation_id: operation_id.into(),
+        namespace: SNAPSHOT_NAMESPACE.into(),
+        deployment: deployment.into(),
         container: "target".into(),
         immutable_image_digest: TARGET_IMAGE.into(),
     }
