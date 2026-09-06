@@ -193,11 +193,13 @@ Run the seeded lifecycle simulation:
 ./scripts/test-simulation.sh
 ```
 
-Override its defaults for replay or a longer run:
+Override its defaults for replay, larger scale, or completion notifications:
 
 ```sh
 KAPSEL_SIMULATION_SEED=21182435914953528 \
 KAPSEL_SIMULATION_CASES=10000 \
+KAPSEL_SIMULATION_SHARDS=8 \
+KAPSEL_SIMULATION_NOTIFY_URL=https://ntfy.sh/my-topic \
 ./scripts/test-simulation.sh
 ```
 

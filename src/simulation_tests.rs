@@ -109,7 +109,7 @@ async fn seeded_lifecycle_crash_simulation_preserves_invariants() {
     let shard_index =
         usize::try_from(environment_number("KAPSEL_SIMULATION_SHARD_INDEX", 0)).unwrap();
     assert!(
-        shard_count > 0 && shard_count <= 8 && shard_index < shard_count,
+        shard_count > 0 && shard_count <= 128 && shard_index < shard_count,
         "seed={seed} invalid shard {shard_index}/{shard_count}"
     );
 
