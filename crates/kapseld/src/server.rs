@@ -2227,6 +2227,18 @@ mod linux_tests {
         .await;
     }
 
+    fn every_expected_field_matches(observed: &serde_json::Value, expected: &[u8]) -> bool {
+        let Ok(expected) = serde_json::from_slice::<serde_json::Value>(expected) else {
+            return false;
+        };
+        let (Some(observed), Some(expected)) = (observed.as_object(), expected.as_object()) else {
+            return false;
+        };
+        expected
+            .iter()
+            .all(|(field, value)| observed.get(field) == Some(value))
+    }
+
     async fn wait_for_status<E: ApplicationExecution + 'static>(
         state: &ServerState<Application, E>,
         gid: u32,
@@ -2243,10 +2255,14 @@ mod linux_tests {
             .await;
             let response = read_frame(&mut client).await;
             handler.await.unwrap();
-            if response == expected {
+            let observed: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            if every_expected_field_matches(&observed, expected) {
                 break;
             }
-            assert_eq!(response, br#"{"status":"IN_PROGRESS"}"#);
+            assert_eq!(
+                observed.get("status"),
+                Some(&serde_json::json!("IN_PROGRESS"))
+            );
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

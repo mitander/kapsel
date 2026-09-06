@@ -349,8 +349,8 @@ mod tests {
         let authorization_key = SigningKey::from_bytes(&authorization_seed);
         let authorization = ExactAuthorization {
             approved_target: Some(kapsel::ApprovedTarget {
-                uid: "uid".into(),
-                resource_version: "rv".into(),
+                uid: "uid-1".into(),
+                resource_version: "1".into(),
             }),
             authorization_id: "service-auth".into(),
             operation_id: "service-op".into(),
