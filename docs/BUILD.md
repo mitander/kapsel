@@ -210,6 +210,14 @@ KAPSEL_SIMULATION_NOTIFY_URL=https://ntfy.sh/my-topic \
 ./scripts/test-simulation.sh
 ```
 
+Run the automated nightly soak runner (auto-update, crash recovery, bug deduplication,
+notifications):
+
+```sh
+KAPSEL_NOTIFY_URL=https://ntfy.sh/my-topic \
+./scripts/run-nightly-soak.sh
+```
+
 ## Candidate qualification
 
 Run every finite qualification lane against one committed clean candidate:
