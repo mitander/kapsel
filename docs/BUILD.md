@@ -185,7 +185,14 @@ rustup run nightly-2026-07-03 cargo fuzz check --manifest-path fuzz/Cargo.toml i
 ./scripts/test-fuzz.sh
 ```
 
-For a longer session, run `cargo +nightly fuzz run inspect_receipt` from `fuzz/`.
+Override fuzz defaults for a longer timed session with completion notifications:
+
+```sh
+KAPSEL_FUZZ_RUNS=1000000 \
+KAPSEL_FUZZ_MAX_TIME=3600 \
+KAPSEL_FUZZ_NOTIFY_URL=https://ntfy.sh/my-topic \
+./scripts/test-fuzz.sh
+```
 
 Run the seeded lifecycle simulation:
 
